@@ -1,0 +1,96 @@
+=============================================================================
+Python Artifacts
+=============================================================================
+Byte-compiled / optimized / C extensions
+pycache/
+*.py[cod]
+*$py.class
+
+C extensions
+*.so
+
+Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+PyInstaller
+Usually these files are created by pyinstaller, if you are using it.
+*.manifest
+*.spec
+
+Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
+
+Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+=============================================================================
+Project-Specific Files (Codex-Bellum)
+=============================================================================
+Simulation results and logs
+results/
+prof/
+
+Saved model from the UI
+copied_brain.pth
+
+Video recorder output
+simulation.mp4
+frames_fallback/
+
+=============================================================================
+IDE / Editor Configuration
+=============================================================================
+VS Code
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+
+PyCharm
+.idea/
+
+=============================================================================
+OS-Specific Files
+=============================================================================
+macOS
+.DS_Store
+
+Windows
+Thumbs.db
