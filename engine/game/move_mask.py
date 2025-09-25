@@ -1,135 +1,123 @@
-# final_war_sim/engine/game/move_mask.py
+# codex_bellum/engine/game/move_mask.py
 from __future__ import annotations
 import torch
+from ... import config
 
-from ... import config  # uses MAX_HP, TORCH_DTYPE, etc.
-
-# === Action indices (17 total) ===============================================
-IDLE_IDX = 0
-MOVE_START = 1          # 1..8  (8-way move)
-MOVE_END   = 9
-ATK_START  = 9          # 9..16 (8-way attack)
-ATK_END    = 17
-
-# 8 directions: (dx, dy) with y downwards, x rightwards
-# order must be consistent across engine (viewer arrows etc.)
+# 8 directions (dx, dy): N, NE, E, SE, S, SW, W, NW
 DIRS8 = torch.tensor([
-    [ 0, -1],  # N
-    [ 1, -1],  # NE
-    [ 1,  0],  # E
-    [ 1,  1],  # SE
-    [ 0,  1],  # S
-    [-1,  1],  # SW
-    [-1,  0],  # W
-    [-1, -1],  # NW
+    [ 0, -1],
+    [ 1, -1],
+    [ 1,  0],
+    [ 1,  1],
+    [ 0,  1],
+    [-1,  1],
+    [-1,  0],
+    [-1, -1],
 ], dtype=torch.long)
 
-# Occupancy channel encoding in grid[0]: 0 empty, 2 red, 3 blue
-OCC_EMPTY = 0
-OCC_RED   = 2
-OCC_BLUE  = 3
-
-TEAM_RED_ID  = 2.0
-TEAM_BLUE_ID = 3.0
-
-
 @torch.no_grad()
-def build_mask(pos_xy: torch.Tensor, teams: torch.Tensor, grid: torch.Tensor) -> torch.Tensor:
+def build_mask(
+    pos_xy: torch.Tensor,            # (N,2) long/float (x,y)
+    teams: torch.Tensor,             # (N,)  float: 2.0=red, 3.0=blue
+    grid: torch.Tensor,              # (3,H,W) float; ch0=occ(0,1,2,3)
+    unit: torch.Tensor | None = None # (N,) long/float: 1=soldier, 2=archer
+) -> torch.Tensor:
     """
-    Build a boolean mask of legal actions per agent.
-    Inputs:
-      pos_xy: (N,2) long tensor with [x,y]
-      teams : (N,) float/long with 2.0 for red, 3.0 for blue
-      grid  : (C,H,W) tensor where C>=1 and grid[0] is occupancy as ints {0,2,3}
-    Output:
-      mask  : (N,17) bool tensor, True = legal
-              idx=0 idle
-              idx=1..8  : move N,NE,E,SE,S,SW,W,NW if empty
-              idx=9..16 : attack in those dirs if enemy present
+    Returns action mask [N, A] bool.
+      A=17: idle(1) + 8 moves + 8 melee (r=1)
+      A=41: idle(1) + 8 moves + 8×(r=1..4) ranged
+        - soldier: r=1 only
+        - archer:  r=1..config.ARCHER_RANGE (clipped to 4)
     """
     device = grid.device
-    occ = grid[0]  # (H,W)
-    H, W = occ.shape[-2], occ.shape[-1]
+    N = int(pos_xy.size(0))
+    H, W = int(grid.size(1)), int(grid.size(2))
+    A = int(getattr(config, "NUM_ACTIONS", 17))
+    mask = torch.zeros((N, A), dtype=torch.bool, device=device)
 
-    # Ensure types
-    if pos_xy.dtype != torch.long:
-        pos_xy = pos_xy.long()
-    if teams.dtype.is_floating_point:
-        teams_long = teams.long()
+    # idle
+    if A >= 1:
+        mask[:, 0] = True
+
+    if N == 0 or A <= 1:
+        return mask
+
+    # positions
+    x0 = pos_xy[:, 0].to(torch.long, non_blocking=True)
+    y0 = pos_xy[:, 1].to(torch.long, non_blocking=True)
+    dirs = DIRS8.to(device)  # (8,2)
+
+    # -------------------- MOVE (cols 1..8) --------------------
+    nx = x0.view(N, 1) + dirs[:, 0].view(1, 8)
+    ny = y0.view(N, 1) + dirs[:, 1].view(1, 8)
+    inb = (nx >= 0) & (nx < W) & (ny >= 0) & (ny < H)
+    nx_cl = nx.clamp(0, W - 1)
+    ny_cl = ny.clamp(0, H - 1)
+    occ = grid[0][ny_cl, nx_cl]          # (N,8)
+    free = (occ == 0.0) & inb
+    move_cols = min(8, max(0, A - 1))
+    if move_cols > 0:
+        mask[:, 1:1 + move_cols] = free[:, :move_cols]
+
+    # -------------------- ATTACK --------------------
+    if A <= 9:
+        return mask  # no attack columns at all
+
+    teamv = teams.to(torch.long, non_blocking=True)  # (N,)
+
+    # Legacy 17-action: only r=1 melee per dir
+    if A <= 17:
+        tgt_team = occ  # r=1 neighbor occupancy
+        enemy = (tgt_team != 0.0) & (tgt_team != 1.0) & (tgt_team != teamv.view(N, 1))
+        k = min(8, max(0, A - 9))
+        if k > 0:
+            mask[:, 9:9 + k] = enemy[:, :k]
+        return mask
+
+    # 41-action layout: 8 dirs × 4 ranges
+    RMAX = 4
+    dx = dirs[:, 0].view(1, 8, 1)  # (1,8,1)
+    dy = dirs[:, 1].view(1, 8, 1)
+    rvec = torch.arange(1, RMAX + 1, device=device, dtype=torch.long).view(1, 1, RMAX)
+
+    tx = x0.view(N, 1, 1) + dx * rvec  # (N,8,4)
+    ty = y0.view(N, 1, 1) + dy * rvec
+    inb_r = (tx >= 0) & (tx < W) & (ty >= 0) & (ty < H)
+    txc = tx.clamp(0, W - 1)
+    tyc = ty.clamp(0, H - 1)
+
+    tgt_occ = grid[0][tyc, txc]  # (N,8,4)
+    enemy_r = (tgt_occ != 0.0) & (tgt_occ != 1.0) & (tgt_occ.to(torch.long) != teamv.view(N, 1, 1))
+    enemy_r &= inb_r  # enforce bounds
+
+    # Unit gating: soldiers r=1; archers r<=ARCHER_RANGE
+    if unit is None:
+        units = torch.full((N,), 2, device=device, dtype=torch.long)  # default permissive: archer
     else:
-        teams_long = teams
+        units = unit.to(torch.long, non_blocking=True)
 
-    N = pos_xy.size(0)
+    ar_range = int(getattr(config, "ARCHER_RANGE", 4))
+    ar_range = max(1, min(RMAX, ar_range))
 
-    # (N,1,2) + (1,8,2) -> (N,8,2)
-    base = pos_xy.view(N, 1, 2).to(device)
-    d8   = DIRS8.to(device).view(1, 8, 2)
-    neigh = base + d8  # (N,8,2)
+    allow_r = torch.zeros((N, RMAX), dtype=torch.bool, device=device)  # (N,4)
+    # soldiers
+    allow_r[units == 1, 0] = True
+    # archers
+    if (units == 2).any():
+        allow_r[units == 2, :ar_range] = True
 
-    nx = neigh[..., 0].clamp_(0, W - 1)
-    ny = neigh[..., 1].clamp_(0, H - 1)
+    atk_ok = enemy_r & allow_r.view(N, 1, RMAX)  # (N,8,4)
 
-    # Advanced indexing is safe & fast (no gather OOB asserts)
-    n_occ = occ[ny, nx]  # (N,8)
+    # Write contiguous 4-column blocks per direction
+    base = 9
+    for d in range(8):
+        c0 = base + d * RMAX
+        c1 = c0 + RMAX
+        if c0 >= A:
+            break
+        cols = slice(c0, min(c1, A))
+        rlim = cols.stop - cols.start  # number of range columns we’ll write (<=4)
+        if rlim > 0:
+            mask[:, cols] = atk_ok[:, d, :rlim]
 
-    # Own occupancy id per agent
-    own_occ = torch.where(
-        teams_long.to(device) == int(TEAM_RED_ID),
-        torch.tensor(OCC_RED, device=device, dtype=n_occ.dtype),
-        torch.tensor(OCC_BLUE, device=device, dtype=n_occ.dtype),
-    ).view(N, 1)  # (N,1) for broadcast
-
-    # Legal moves: target cell must be empty
-    move_ok = (n_occ == OCC_EMPTY)  # (N,8)
-
-    # Legal attacks: target cell must be enemy (not empty, not own)
-    atk_ok = (n_occ != OCC_EMPTY) & (n_occ != own_occ)  # (N,8)
-
-    # Compose mask
-    mask = torch.zeros((N, 17), dtype=torch.bool, device=device)
-    mask[:, IDLE_IDX] = True
-    mask[:, MOVE_START:MOVE_END] = move_ok
-    mask[:, ATK_START:ATK_END]   = atk_ok
     return mask
-ACTION = {
-    "IDLE": IDLE_IDX,
-
-    # === Moves (8-way) ===
-    "MOVE_N": MOVE_START + 0,
-    "MOVE_NE": MOVE_START + 1,
-    "MOVE_E": MOVE_START + 2,
-    "MOVE_SE": MOVE_START + 3,
-    "MOVE_S": MOVE_START + 4,
-    "MOVE_SW": MOVE_START + 5,
-    "MOVE_W": MOVE_START + 6,
-    "MOVE_NW": MOVE_START + 7,
-
-    # Cardinal synonyms
-    "MOVE_UP":    MOVE_START + 0,
-    "MOVE_RIGHT": MOVE_START + 2,
-    "MOVE_DOWN":  MOVE_START + 4,
-    "MOVE_LEFT":  MOVE_START + 6,
-
-    # === Attacks (8-way) ===
-    "ATK_N": ATK_START + 0,
-    "ATK_NE": ATK_START + 1,
-    "ATK_E": ATK_START + 2,
-    "ATK_SE": ATK_START + 3,
-    "ATK_S": ATK_START + 4,
-    "ATK_SW": ATK_START + 5,
-    "ATK_W": ATK_START + 6,
-    "ATK_NW": ATK_START + 7,
-
-    # Synonyms (short)
-    "ATK_UP":    ATK_START + 0,
-    "ATK_RIGHT": ATK_START + 2,
-    "ATK_DOWN":  ATK_START + 4,
-    "ATK_LEFT":  ATK_START + 6,
-
-    # Synonyms (long — tick.py uses these)
-    "ATTACK_UP":    ATK_START + 0,
-    "ATTACK_RIGHT": ATK_START + 2,
-    "ATTACK_DOWN":  ATK_START + 4,
-    "ATTACK_LEFT":  ATK_START + 6,
-}
-

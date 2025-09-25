@@ -1,16 +1,15 @@
-# final_war_sim/ui/viewer.py
 from __future__ import annotations
 import os
-from typing import List, Tuple, Optional
-
+from typing import List, Tuple, Optional, Dict
 import pygame
 import torch
 import torch.nn as nn
+import numpy as np
 
 from .. import config
 from ..simulation.stats import TEAM_RED, TEAM_BLUE
 from .camera import Camera
-from ..engine.agent_registry import COL_ALIVE, COL_TEAM
+from ..engine.agent_registry import COL_ALIVE, COL_TEAM, COL_UNIT
 from ..agent.mutation import pick_mutants, mutate_model_inplace
 
 FONT_NAME = "consolas"
@@ -24,8 +23,20 @@ COLORS = {
     "border":    (64, 68, 76),
     "wall":      (78, 82, 92),
     "empty":     (22, 24, 28),
+
+    # team base colors
     "red":       (220, 80, 80),
     "blue":      (80, 120, 240),
+
+    # team-by-unit variants (archers slightly lighter)
+    "red_soldier":  (220, 80, 80),
+    "red_archer":   (245, 135, 135),
+    "blue_soldier": (80, 120, 240),
+    "blue_archer":  (130, 165, 255),
+
+    # archer glyph overlay (high-contrast ring)
+    "archer_glyph": (245, 230, 90),
+
     "marker":    (242, 228, 92),
     "text":      (230, 230, 230),
     "text_dim":  (180, 186, 194),
@@ -34,6 +45,13 @@ COLORS = {
     "bar_bg":    (38, 42, 48),
     "bar_fg":    (90, 200, 130),
 }
+
+# RGBA overlays (used on SRCALPHA surfaces)
+OVERLAY_HEAL = (90, 200, 140, 60)     # faint green fill per heal tile
+OVERLAY_CP   = (210, 210, 230, 48)    # neutral fill for capture patches
+OUTLINE_RED  = (220, 80, 80, 160)
+OUTLINE_BLUE = (80, 120, 240, 160)
+OUTLINE_NEU  = (160, 160, 170, 120)
 
 def _mk_font(sz: int) -> pygame.font.Font:
     try:
@@ -47,14 +65,12 @@ def _center_window() -> None:
 # ---------- model introspection ----------
 def _linear_shape_list(model: nn.Module) -> List[Tuple[int, int]]:
     shapes = []
-    # Works for raw nn.Module
     try:
-        for name, module in model.named_modules():
+        for _, module in model.named_modules():
             if isinstance(module, nn.Linear):
                 shapes.append((module.in_features, module.out_features))
     except Exception:
         pass
-    # Fallback: ScriptModule raw parameter shape sniffing
     if not shapes:
         try:
             for k, v in model.state_dict().items():
@@ -63,8 +79,6 @@ def _linear_shape_list(model: nn.Module) -> List[Tuple[int, int]]:
         except Exception:
             pass
     return shapes
-
-
 
 def _format_mlp_shape(shapes: List[Tuple[int, int]]) -> str:
     if not shapes:
@@ -121,13 +135,16 @@ class Viewer:
 
         self.selected_id: Optional[int] = None
         self.marked: List[int] = []
-        self.prev_occ = None
+        self.prev_occ: Optional[np.ndarray] = None
+        self.prev_unit: Optional[np.ndarray] = None
         self.show_grid = show_grid
         self.registry = None  # set in run()
 
+        # prebuilt zone overlay geometry (CPU cache)
+        self._zone_cache: Optional[Dict[str, object]] = None
+
     # ---------- dynamic layout ----------
     def _side_width(self) -> int:
-        # adaptive side panel width
         target = int(self.Wpix * 0.27)
         return max(self.side_min_w, min(self.side_max_w, target))
 
@@ -215,6 +232,7 @@ class Viewer:
                 self.Wpix, self.Hpix = max(800, ev.w), max(520, ev.h)
                 self.screen = pygame.display.set_mode((self.Wpix, self.Hpix), pygame.RESIZABLE)
                 self.prev_occ = None
+                self.prev_unit = None
 
             elif ev.type == pygame.KEYDOWN:
                 if ev.key == pygame.K_ESCAPE:
@@ -246,9 +264,9 @@ class Viewer:
                         agent_id = int(self.grid[2, gy, gx].item())
                         self.selected_id = agent_id if agent_id >= 0 else None
                 elif ev.button == 4:  # wheel up
-                    self.cam.zoom_at(1.12); self.prev_occ = None
+                    self.cam.zoom_at(1.12); self.prev_occ = None; self.prev_unit = None
                 elif ev.button == 5:  # wheel down
-                    self.cam.zoom_at(1/1.12); self.prev_occ = None
+                    self.cam.zoom_at(1/1.12); self.prev_occ = None; self.prev_unit = None
 
         return running
 
@@ -259,18 +277,46 @@ class Viewer:
     def _hud_text_small(self, text: str, x: int, y: int, color=COLORS["text_dim"]) -> None:
         self.screen.blit(self.font_small.render(text, True, color), (x, y))
 
-    def _draw_cell(self, surf: pygame.Surface, x: int, y: int, val: int) -> None:
-        if val == 1:   color = COLORS["wall"]
-        elif val == 2: color = COLORS["red"]
-        elif val == 3: color = COLORS["blue"]
-        else:          color = COLORS["empty"]
+    def _draw_archer_glyph(self, surf: pygame.Surface, cx: int, cy: int, c: int) -> None:
+        """Draw a high-contrast archer ring inside the cell.
+        Scales with zoom, gracefully disappears for tiny cells.
+        """
+        if c < 5:
+            return
+        color = COLORS["archer_glyph"]
+        # Center of cell
+        center = (cx + c // 2, cy + c // 2)
+        # Outer radius leaves 1px margin; thickness scales with cell size
+        radius = max(2, (c // 2) - 1)
+        width = max(1, c // 6)
+        try:
+            pygame.draw.circle(surf, color, center, radius, width)
+        except Exception:
+            # Fallback: small inner square if circle fails for any reason
+            pad = max(1, c // 4)
+            pygame.draw.rect(surf, color, pygame.Rect(cx + pad, cy + pad, max(1, c - 2 * pad), max(1, c - 2 * pad)), width=max(1, width // 2))
+
+    def _draw_cell(self, surf: pygame.Surface, x: int, y: int, occ_val: int, unit_val: int) -> None:
+        # occ: 0 empty, 1 wall, 2 red, 3 blue
+        if occ_val == 1:
+            color = COLORS["wall"]
+        elif occ_val == 2:
+            color = COLORS["red_archer"] if unit_val == 2 else COLORS["red_soldier"] if unit_val == 1 else COLORS["red"]
+        elif occ_val == 3:
+            color = COLORS["blue_archer"] if unit_val == 2 else COLORS["blue_soldier"] if unit_val == 1 else COLORS["blue"]
+        else:
+            color = COLORS["empty"]
 
         cx, cy = self.cam.world_to_screen(x, y)
         c = self.cam.cell_px
         wrect = self._world_rect()
         cx += wrect.x; cy += wrect.y
         if cx >= wrect.x - c and cy >= wrect.y - c and cx < wrect.right and cy < wrect.bottom:
-            surf.fill(color, pygame.Rect(cx, cy, c, c))
+            cell_rect = pygame.Rect(cx, cy, c, c)
+            surf.fill(color, cell_rect)
+            # Archer highlight: draw a bright ring overlay
+            if (occ_val == 2 or occ_val == 3) and unit_val == 2:
+                self._draw_archer_glyph(surf, cx, cy, c)
 
     def _draw_grid_lines(self, surf: pygame.Surface) -> None:
         if not self.show_grid or self.cam.cell_px < 6:
@@ -307,22 +353,93 @@ class Viewer:
             cx += wrect.x; cy += wrect.y
             pygame.draw.rect(surf, COLORS["marker"], pygame.Rect(cx, cy, c, c), width=max(1, c // 8))
 
-    def _draw_world(self, surf: pygame.Surface, cur_occ_np) -> None:
+    # ---------- zone cache ----------
+    def _build_zone_overlay_cache(self, engine) -> None:
+        """Build static CPU-side geometry for overlays to avoid per-frame transfers."""
+        self._zone_cache = {"heal_tiles": [], "cp_rects": []}
+        zones = getattr(engine, "zones", None)
+        if zones is None:
+            return
+        try:
+            # heal tiles
+            if getattr(zones, "heal_mask", None) is not None:
+                hm = zones.heal_mask.detach().cpu().numpy()
+                ys, xs = np.nonzero(hm)
+                self._zone_cache["heal_tiles"] = list(zip(xs.tolist(), ys.tolist()))
+            # capture rects (tight bounds of masks)
+            for m in getattr(zones, "cp_masks", []) or []:
+                mm = m.detach().cpu().numpy()
+                ys, xs = np.nonzero(mm)
+                if xs.size == 0:
+                    continue
+                x0, x1 = int(xs.min()), int(xs.max()) + 1
+                y0, y1 = int(ys.min()), int(ys.max()) + 1
+                self._zone_cache["cp_rects"].append((x0, y0, x1, y1))
+        except Exception as e:
+            print(f"[viewer] WARN: zone cache build failed: {e}")
+            self._zone_cache = {"heal_tiles": [], "cp_rects": []}
+
+    # ---------- zone overlays ----------
+    def _draw_zone_overlays(self, cpu_occ_np: np.ndarray) -> None:
+        if not self._zone_cache:
+            return
+
+        wrect = self._world_rect()
+        c = self.cam.cell_px
+        overlay = pygame.Surface((wrect.width, wrect.height), pygame.SRCALPHA)
+
+        # heal tiles
+        for x, y in self._zone_cache["heal_tiles"]:
+            cx, cy = self.cam.world_to_screen(int(x), int(y))
+            if 0 <= cx < wrect.width and 0 <= cy < wrect.height:
+                overlay.fill(OVERLAY_HEAL, pygame.Rect(cx, cy, c, c))
+
+        # capture rects
+        for (x0, y0, x1, y1) in self._zone_cache["cp_rects"]:
+            cx0, cy0 = self.cam.world_to_screen(x0, y0)
+            cx1, cy1 = self.cam.world_to_screen(x1, y1)
+            rect = pygame.Rect(cx0, cy0, max(1, cx1 - cx0), max(1, cy1 - cy0))
+            overlay.fill(OVERLAY_CP, rect)
+
+            # determine leader from current occupancy
+            patch = cpu_occ_np[y0:y1, x0:x1]
+            red_cnt = int((patch == 2).sum())
+            blue_cnt = int((patch == 3).sum())
+            if red_cnt > blue_cnt:
+                border_col = OUTLINE_RED;   label = ("R", COLORS["red"])
+            elif blue_cnt > red_cnt:
+                border_col = OUTLINE_BLUE;  label = ("B", COLORS["blue"])
+            else:
+                border_col = OUTLINE_NEU;   label = ("–", COLORS["text_dim"])
+
+            pygame.draw.rect(overlay, border_col, rect, width=max(1, c // 2))
+            lab = self.font_small.render(label[0], True, label[1])
+            overlay.blit(lab, lab.get_rect(center=(rect.x + rect.w // 2, rect.y + rect.h // 2)))
+
+        self.screen.blit(overlay, (wrect.x, wrect.y))
+
+    def _draw_world(self, surf: pygame.Surface, cur_occ_np: np.ndarray, cur_unit_np: np.ndarray) -> None:
         H, W = cur_occ_np.shape
         wrect = self._world_rect()
         surf.fill(COLORS["bg"], wrect)
 
-        full = (self.prev_occ is None) or (self.cam.zoom != 1.0) or (self.cam.cell_px != self.cell)
+        full = (
+            self.prev_occ is None
+            or self.prev_unit is None
+            or (self.cam.zoom != 1.0)
+            or (self.cam.cell_px != self.cell)
+        )
         if full:
             for y in range(H):
                 for x in range(W):
-                    self._draw_cell(surf, x, y, int(cur_occ_np[y, x]))
+                    self._draw_cell(surf, x, y, int(cur_occ_np[y, x]), int(cur_unit_np[y, x]))
         else:
-            changed = (self.prev_occ != cur_occ_np).nonzero()
+            changed = np.where((self.prev_occ != cur_occ_np) | (self.prev_unit != cur_unit_np))
             if changed[0].size > 0:
                 for y, x in zip(changed[0], changed[1]):
-                    self._draw_cell(surf, int(x), int(y), int(cur_occ_np[y, x]))
+                    self._draw_cell(surf, int(x), int(y), int(cur_occ_np[y, x]), int(cur_unit_np[y, x]))
         self.prev_occ = cur_occ_np.copy()
+        self.prev_unit = cur_unit_np.copy()
 
     # ---------- agent helpers ----------
     def _agent_current_xy(self, cpu_id: torch.Tensor, agent_id: int) -> Optional[Tuple[int, int]]:
@@ -352,6 +469,7 @@ class Viewer:
             self._hud_text_small("• M to mark up to 10", x, y); y += 16
             self._hud_text_small("• C to copy brain", x, y); y += 16
             self._hud_text_small("• E to mutate ~10%", x, y); y += 16
+            self._hud_text_small("• Archers have a yellow ring", x, y); y += 16
             return
 
         aid = self.selected_id
@@ -419,27 +537,41 @@ class Viewer:
         self._hud_text(f"Tick {stats.tick} | Elapsed {stats.elapsed_seconds:7.2f}s | Zoom {self.cam.zoom:.2f}x",
                        10, y0)
 
-        # --- compute alive + spawned ---
+        # --- compute alive + spawned + by-unit live counts ---
         alive_red = alive_blue = 0
         spawned_red = spawned_blue = 0
+        r_s_alive = r_a_alive = b_s_alive = b_a_alive = 0
         if self.registry is not None:
             data = self.registry.agent_data
-            alive_red = int(((data[:, COL_ALIVE] > 0.5) & (data[:, COL_TEAM] == 2.0)).sum().item())
-            alive_blue = int(((data[:, COL_ALIVE] > 0.5) & (data[:, COL_TEAM] == 3.0)).sum().item())
-            spawned_red = int((data[:, COL_TEAM] == 2.0).sum().item())
-            spawned_blue = int((data[:, COL_TEAM] == 3.0).sum().item())
+            alive_mask = (data[:, COL_ALIVE] > 0.5)
+            is_red  = (data[:, COL_TEAM] == 2.0)
+            is_blue = (data[:, COL_TEAM] == 3.0)
+            is_sold = (data[:, COL_UNIT] == 1.0)
+            is_arch = (data[:, COL_UNIT] == 2.0)
 
-        # --- team lines ---
+            alive_red  = int((alive_mask & is_red ).sum().item())
+            alive_blue = int((alive_mask & is_blue).sum().item())
+            spawned_red  = int(is_red.sum().item())
+            spawned_blue = int(is_blue.sum().item())
+
+            r_s_alive = int((alive_mask & is_red  & is_sold).sum().item())
+            r_a_alive = int((alive_mask & is_red  & is_arch).sum().item())
+            b_s_alive = int((alive_mask & is_blue & is_sold).sum().item())
+            b_a_alive = int((alive_mask & is_blue & is_arch).sum().item())
+
+        # --- team lines (with CP and by-unit counts) ---
         self._hud_text(
-            f"Red  S:{stats.red.score:7.2f}  K:{stats.red.kills}  D:{stats.red.deaths}  "
+            f"Red  S:{stats.red.score:7.2f}  CP:{getattr(stats.red, 'cp_points', 0.0):.1f}  "
+            f"K:{stats.red.kills}  D:{stats.red.deaths}  "
             f"DMG→:{stats.red.dmg_dealt:.1f}  DMG←:{stats.red.dmg_taken:.1f}  "
-            f"Alive:{alive_red}  Spawned:{spawned_red}",
+            f"Alive:{alive_red}  (S:{r_s_alive} A:{r_a_alive})  Spawned:{spawned_red}",
             10, y0 + 24, (220, 110, 110)
         )
         self._hud_text(
-            f"Blue S:{stats.blue.score:7.2f}  K:{stats.blue.kills} D:{stats.blue.deaths}  "
+            f"Blue S:{stats.blue.score:7.2f}  CP:{getattr(stats.blue, 'cp_points', 0.0):.1f}  "
+            f"K:{stats.blue.kills} D:{stats.blue.deaths}  "
             f"DMG→:{stats.blue.dmg_dealt:.1f} DMG←:{stats.blue.dmg_taken:.1f}  "
-            f"Alive:{alive_blue}  Spawned:{spawned_blue}",
+            f"Alive:{alive_blue} (S:{b_s_alive} A:{b_a_alive})  Spawned:{spawned_blue}",
             10, y0 + 46, (110, 150, 240)
         )
 
@@ -449,10 +581,11 @@ class Viewer:
             10, hud.bottom - 20, COLORS["text_dim"]
         )
 
-
     # ---------- main loop ----------
     def run(self, engine, registry, stats, tick_limit: int = 0, target_fps: Optional[int] = None) -> None:
         self.registry = registry
+        self._build_zone_overlay_cache(engine)  # build once (static over the run)
+
         fps = int(target_fps or config.TARGET_FPS)
         running = True
 
@@ -462,17 +595,28 @@ class Viewer:
             # one simulation tick
             engine.run_tick()
 
-            # minimal CPU copies
+            # minimal CPU copies (BLOCKING to avoid jitter)
             with torch.no_grad():
-                cpu_occ = self.grid[0].to("cpu", non_blocking=True).to(torch.int16).numpy()
-                cpu_id  = self.grid[2].to("cpu", non_blocking=True).to(torch.int32)
+                cpu_occ = self.grid[0].detach().cpu().to(torch.int16).numpy()
+                cpu_id_t = self.grid[2].detach().cpu().to(torch.int32)  # tensor for markers
+                cpu_id_np = cpu_id_t.numpy()
+
+                # Build per-tile unit map on CPU (0 none, 1 soldier, 2 archer)
+                unit_np = np.zeros_like(cpu_id_np, dtype=np.int16)
+                if self.registry is not None:
+                    units_by_id = self.registry.agent_data[:, COL_UNIT].detach().cpu().to(torch.int16).numpy()
+                    # safe indexing mask (protect against stale ids)
+                    mask = (cpu_id_np >= 0) & (cpu_id_np < units_by_id.shape[0])
+                    if mask.any():
+                        unit_np[mask] = units_by_id[cpu_id_np[mask]]
 
             # draw
-            self._draw_world(self.screen, cpu_occ)
+            self._draw_world(self.screen, cpu_occ, unit_np)
+            self._draw_zone_overlays(cpu_occ)  # overlays on top
             self._draw_grid_lines(self.screen)
-            self._draw_markers(self.screen, cpu_id)
-            self._draw_side_panel(cpu_id)
-            self._draw_hud(stats, cpu_id)
+            self._draw_markers(self.screen, cpu_id_t)
+            self._draw_side_panel(cpu_id_t)
+            self._draw_hud(stats, cpu_id_t)
 
             pygame.display.flip()
             self.clock.tick(fps)

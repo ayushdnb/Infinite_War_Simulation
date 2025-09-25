@@ -112,7 +112,7 @@ def pick_mutants(alive_indices: torch.Tensor,
 
 # ---------------- Mutation (exported; used by registry via TickEngine) ----------------
 @torch.no_grad()
-def mutate_model_inplace(model: nn.Module, now_tick: Optional[int] = None) -> bool:
+def mutate_model_inplace(model: nn.Module, now_tick: Optional[int] = None) -> nn.Module:
     """
     Gentle mutation to avoid parameter explosion:
       1) Usually: small weight noise on a tiny subset of params.
@@ -136,11 +136,10 @@ def mutate_model_inplace(model: nn.Module, now_tick: Optional[int] = None) -> bo
             old_h = model.fc2.out_features
             new_h = new_fc2.out_features
 
-            # Temporarily install to measure size, and wire heads if shapes match
             old_fc2 = model.fc2
             model.fc2 = new_fc2
 
-            # Adjust actor head if it consumed old_h
+            # Adjust actor head
             if hasattr(model, "actor") and isinstance(model.actor, nn.Linear) and model.actor.in_features == old_h:
                 new_actor = nn.Linear(new_h, model.actor.out_features, bias=model.actor.bias is not None)
                 with torch.no_grad():
@@ -149,7 +148,7 @@ def mutate_model_inplace(model: nn.Module, now_tick: Optional[int] = None) -> bo
                         new_actor.bias.copy_(model.actor.bias)
                 model.actor = new_actor
 
-            # Adjust critic head if it consumed old_h
+            # Adjust critic head
             if hasattr(model, "critic") and isinstance(model.critic, nn.Linear) and model.critic.in_features == old_h:
                 new_critic = nn.Linear(new_h, model.critic.out_features, bias=model.critic.bias is not None)
                 with torch.no_grad():
@@ -158,13 +157,12 @@ def mutate_model_inplace(model: nn.Module, now_tick: Optional[int] = None) -> bo
                         new_critic.bias.copy_(model.critic.bias)
                 model.critic = new_critic
 
-            # Enforce hard cap (revert if exceeded)
             if param_count(model) > MAX_PARAMS_PER_BRAIN:
-                model.fc2 = old_fc2  # revert
+                model.fc2 = old_fc2  # revert if over budget
             else:
                 changed = True
 
-    # (3) Light prune if above soft budget (keeps models small over time)
+    # (3) Light prune if above soft budget
     if hasattr(model, "fc2") and isinstance(model.fc2, nn.Linear) and param_count(model) > PRUNE_SOFT_BUDGET:
         drop = random.randint(PRUNE_NEURON_DROP_MIN, PRUNE_NEURON_DROP_MAX)
         pruned_fc2 = _drop_neurons_magnitude(model.fc2, drop=drop)
@@ -173,7 +171,7 @@ def mutate_model_inplace(model: nn.Module, now_tick: Optional[int] = None) -> bo
             new_h = pruned_fc2.out_features
             model.fc2 = pruned_fc2
 
-            # Rewire heads to the new hidden size (copy what fits)
+            # Rewire actor
             if hasattr(model, "actor") and isinstance(model.actor, nn.Linear) and model.actor.in_features == old_h:
                 new_actor = nn.Linear(new_h, model.actor.out_features, bias=model.actor.bias is not None)
                 with torch.no_grad():
@@ -183,6 +181,7 @@ def mutate_model_inplace(model: nn.Module, now_tick: Optional[int] = None) -> bo
                         new_actor.bias.copy_(model.actor.bias)
                 model.actor = new_actor
 
+            # Rewire critic
             if hasattr(model, "critic") and isinstance(model.critic, nn.Linear) and model.critic.in_features == old_h:
                 new_critic = nn.Linear(new_h, model.critic.out_features, bias=model.critic.bias is not None)
                 with torch.no_grad():
@@ -192,7 +191,7 @@ def mutate_model_inplace(model: nn.Module, now_tick: Optional[int] = None) -> bo
                         new_critic.bias.copy_(model.critic.bias)
                 model.critic = new_critic
 
-            # After prune, we should be under hard cap; no revert needed
             changed = True
 
-    return changed
+    return model
+
