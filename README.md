@@ -1,236 +1,490 @@
-<div align="center">
-<img src="https://www.google.com/search?q=https://placehold.co/600x300/121418/FFFFFF%3Ftext%3DCodex-Bellum%26font%3Dmontserrat" alt="Codex-Bellum Banner">
-<h1>Codex-Bellum</h1>
-<p><b>An Engine for Emergent Combat Doctrines</b></p>
-<p><i>Survival of the fittest, rewritten in PyTorch. A high-performance digital crucible where thousands of neural agents evolve their own "Book of War."</i></p>
+# WarSim Pro — Production‑Grade 2‑D Multi‑Agent Battle Simulator 🧠
 
-<p>
-<a href="#"><img src="https://www.google.com/search?q=https://img.shields.io/badge/python-3.9%2B-blue.svg" alt="Python Version"></a>
-<a href="#"><img src="https://www.google.com/search?q=https://img.shields.io/badge/pytorch-2.0%2B-orange.svg" alt="PyTorch Version"></a>
-<a href="#"><img src="https://www.google.com/search?q=https://img.shields.io/badge/license-MIT-green.svg" alt="License"></a>
-<a href="#"><img src="https://www.google.com/search?q=https://img.shields.io/badge/status-active-brightgreen.svg" alt="Project Status"></a>
-</p>
-</div>
+> **Status:** Research‑grade, modular, and performance‑tuned for single‑GPU laptops (Windows 11, CUDA 12.x, RTX 3060 6 GB, 16 GB RAM).
+> **Goals:** Deterministic contracts, ultra‑loose coupling, high observability, 2k+ agents at ≥60 ticks/s on a 128×128 grid.
 
-Codex-Bellum is not a game. It is a massively multi-agent simulation framework where the doctrines of war are not programmed, but discovered. In this 2D world, thousands of autonomous agents, each guided by a unique and evolving neural network, discover sophisticated combat tactics from first principles.
+---
 
-This repository provides a research-grade, high-performance platform for studying neuroevolution, emergent complexity, and the genesis of intelligent, coordinated behavior. The "Codex" is the unwritten, ever-changing set of strategies that proves superior in the relentless crucible of digital conflict.
+## 0. Executive Overview 📌
 
-<p align="center">
-<!-- TODO: Replace with an actual GIF of the simulation. -->
-<img src="https://www.google.com/search?q=https://placehold.co/800x450/121418/80C0F0%3Ftext%3DSimulation%2Bin%2BAction%2B(Placeholder%2BGIF)" alt="Simulation Showcase">
-<br>
-<em>Thousands of agents in a dynamic, large-scale conflict.</em>
-</p>
+**WarSim Pro** is a ground‑up, contract‑first rewrite of a 2‑D multi‑agent combat simulator. It cleanly separates **perception → ego‑frame → policy → mask → sampling → engine → grid** and imposes hard **ABI contracts** for actions, directions, observations, and masks. All hot paths are vectorized and GPU‑friendly (Struct‑of‑Arrays), with numerically stable tiny networks per agent for scale.
 
-✨ Core Features
-🧠 Neuroevolution at Scale: Every single agent possesses a unique, mutable ActorCriticBrain. The system doesn't train a single master policy, but rather a diverse ecosystem of thousands of competing, evolving minds.
+### Design Tenets
 
-🧬 Hybrid Learning Paradigm: Fuses state-of-the-art Per-Agent Proximal Policy Optimization (PPO) for short-term reward maximization with Genetic Algorithms for long-term structural evolution. Brains don't just learn—they grow, prune, and adapt their very architecture over generations.
+* **Contracts over code:** Rigid schemas for action layout, directional groups, and observation blocks.
+* **Strict modularity:** Each layer is independently swappable; tests pin invariants at the seams.
+* **Performance discipline:** SoA tensors, batched per‑bucket inference, no dynamic Python in inner loops.
+* **Observability & testability:** Action/mask stats, mutation logs, perf counters; unit & property tests for rotation invariants.
+* **Determinism knobs:** Global seeds, fixed init, and Torch AMP safety (float32 casts at model inputs).
 
-🚀 High-Performance GPU Architecture: Engineered from the ground up for massive parallelism. Leverages a Struct-of-Arrays (SoA) memory layout, vectorized PyTorch operations, and AMP (float16) for maximum throughput, simulating thousands of agents at high TPS.
+---
 
-👁️ Dynamic Raycast Perception: Agents perceive their environment not through a simple grid view, but through an efficient 8-directional raycasting engine, providing rich, high-dimensional input about nearby allies, enemies, and obstacles.
+## 1. System Architecture 🏗️
 
-📊 Extensive Data & Analytics: Every action, death, and state change can be recorded. The simulation features a background persistence writer for CSV and Parquet, capturing detailed logs for offline analysis, policy inspection, and academic research.
+```
+                 ┌────────────────────────────────────────────────┐
+                 │                 Tick Engine                    │
+                 │  (time step, collisions, hp, deaths, scoring) │
+                 └───────────────┬────────────────────────────────┘
+                                 │
+                                 │ alive indices (K)
+                                 ▼
+┌──────────────────────────┐   positions/teams  ┌──────────────────────────┐
+│      Agents Registry     │ ─────────────────▶ │     Ego‑Frame Runtime    │
+│   SoA tensor + brains    │                   │  heading8, rotate rays   │
+└───────────┬──────────────┘                   └──────────┬───────────────┘
+            │                                           rotated obs (K,85)
+            │ buckets by NN signature                              │
+            ▼                                                       ▼
+┌──────────────────────────┐   per‑bucket obs    ┌──────────────────────────┐
+│        Bucketer          │ ─────────────────▶ │       Policy Runner       │
+│ groups alive agents by   │                    │ per‑bucket forward pass   │
+│ identical brain topology │ ◀──────────────────│ (K_b, F) → (K_b, A)       │
+└───────────┬──────────────┘  value/logits      └──────────┬───────────────┘
+            │                                             unrotate by heading
+            ▼                                                       │
+┌──────────────────────────┐           logits (global dirs)         ▼
+│      Mask Builder        │ ◀─────────────────────────────────┌──────────────┐
+│  move/attack constraints │                                   │  Sampler     │
+└───────────┬──────────────┘                                   └────┬─────────┘
+            │ actions                                                 │
+            ▼                                                         ▼
+┌──────────────────────────┐                               ┌──────────────────┐
+│         Engine           │ ───────────────────────────▶  │  Grid (3,H,W)    │
+│ moves, attacks, respawns │                               │ occ/hp/agent_id  │
+└───────────┬──────────────┘                               └────────┬─────────┘
+            │ rays                                                      │
+            ▼                                                           ▼
+┌──────────────────────────┐                                   ┌────────────────┐
+│         Raycaster        │ ◀──────────────────────────────── │  Map/Zones     │
+│ first‑hit 8×8 features   │                                   │ walls/heal/CP  │
+└──────────────────────────┘                                   └────────────────┘
+```
 
-🖥️ Interactive Visualization Engine: A sophisticated UI built with Pygame allows for real-time observation, camera control (pan/zoom), and direct inspection of any agent's state, neural network topology, and vital statistics.
+**Key flows:**
 
-🏛️ Architecture Deep Dive
-The engine's design prioritizes performance, scalability, and research flexibility. It's built on a foundation of highly optimized, decoupled components.
+* **Ego‑frame** rotates the 8 ray slots so index 0 = “ahead”; **unrotation** restores global action indices before masking/sampling.
+* **Buckets** ensure batched inference per unique brain topology to minimize kernel launches.
+* **Masks** enforce legal moves/attacks (17 or 41 action layout) with unit‑type gating.
 
-1. The Simulation Trinity
-The core of the simulation is managed by three tightly integrated, GPU-native components:
+---
 
-AgentsRegistry: The central nervous system. It manages all agent state within a single, massive SoA tensor (MAX_AGENTS, AGENT_FEATURES). This layout is critical for coalesced memory access on the GPU, enabling vectorized operations across the entire agent population simultaneously. It also holds the list of individual brain models for each agent.
+## 2. Hard Contracts (ABI) 🔒
 
-Grid: A multi-layered tensor (3, H, W) representing the world state:
+### 2.1 Direction Set (DIRS8)
 
-Channel 0: Occupancy (empty, wall, red team, blue team)
+Order: **N, NE, E, SE, S, SW, W, NW**.
+Single source of truth is shared by **ego‑frame, masks, and raycaster**. All rotation/unrotation assumes this order.
 
-Channel 1: Health Points
+### 2.2 Action Layout (A = 17 or 41)
 
-Channel 2: Agent ID at that location
-This structure allows for instant, parallel lookups and modifications.
+* **Index 0**: idle
+* **1..8**: move in DIRS8 (one bin per direction)
+* If **A = 17**: **9..16** = melee (r=1) in DIRS8.
+* If **A = 41**: **9..40** = ranged (DIRS8 × r=1..4) contiguous per direction; groups are exact 8‑wide blocks.
 
-TickEngine: The heart of the simulation. It orchestrates each discrete timestep, from agent perception and action selection to movement, combat resolution, and state updates. All operations within the engine are designed to be vectorized and conflict-free.
+### 2.3 Observation V2 (F = 85)
 
-2. The Agent Brain & Learning
-ActorCriticBrain: A canonical Actor-Critic neural network serves as the universal mind for all agents. Its simplicity is a feature, providing a stable foundation for genetic mutation. The network exposes its layers (fc1, fc2, actor, critic) to allow the mutation engine to perform architectural modifications.
+* **0..63**: **rays (64)** = 8 rays × 8 features: `onehot6(type) + dist_norm + hp_norm`.
 
-PerAgentPPO: A custom PPO implementation that operates on experience collected in windows of time (PPO_WINDOW_TICKS). It calculates team-level rewards and updates the brains of a subset of agents in each window, ensuring that learning remains computationally tractable even with thousands of agents.
+  * type classes: 0: none, 1: wall, 2: red‑soldier, 3: red‑archer, 4: blue‑soldier, 5: blue‑archer.
+* **64..84**: **rich self/env (21)** (freeform features; stable ordering enforced by tests).
+* **Ego‑frame** rotates *only* the first 64 dims.
 
-MutationEngine: This is where long-term evolution occurs. It applies a suite of genetic operators to agent brains:
+### 2.4 Grid Channels (3, H, W)
 
-Weight Perturbation: Adds small Gaussian noise to a fraction of weights, enabling fine-tuning.
+0: occupancy (0 empty, 1 wall, 2 red, 3 blue) · 1: hp (0..MAX\_HP) · 2: agent\_id (−1 if empty).
 
-Network Widening: Occasionally adds new neurons to hidden layers, allowing for an increase in model capacity.
+### 2.5 Units
 
-Network Pruning: Removes neurons with the lowest L2 magnitude if a brain exceeds a "soft" parameter budget, promoting efficiency.
-This hybrid approach allows agents to learn effective short-term tactics via PPO while their underlying brain structures evolve over generations to better support more complex strategies.
+* 1: **Soldier** (melee; ranged r=1 only)
+* 2: **Archer**  (ranged; r≤`ARCHER_RANGE` ≤ 4)
 
-3. Performance Engineering
-Performance is not an afterthought; it is a core design principle.
+**Invariant tests** cover: direction roll consistency, ego‑rotation/unrotation idempotence on 8‑wide groups, and mask algebra for bounds/unit gating.
 
-Vectorization: All critical loops—perception, action masking, movement, and combat—are fully vectorized. There are no for loops over agents in the hot path.
+---
 
-Conflict-Free Parallelism: Movement conflicts (two agents wanting the same cell) are resolved in a single parallel step using scatter_add_ to count target destinations.
+## 3. Repository Layout 📂
 
-Automatic Mixed Precision (AMP): The entire simulation can run in torch.float16 on compatible GPUs, nearly doubling performance and halving memory usage with minimal loss in precision.
+```
+final_war_sim/
+├─ agent/
+│  ├─ brain.py                 # Tiny Actor‑Critic + RayEncoder (PE + tiny attention)
+│  ├─ encoders.py              # RingPositionalEncoding, TinyRayAttention, RayEncoder
+│  ├─ heads.py                 # FactorizedDirectionalHeads (idle + DIRS8 groups)
+│  ├─ ensemble.py              # Batched per‑bucket forward (value kept 1‑D)
+│  └─ mutation.py              # Gentle evolve: tiny noise, micro‑widen/prune, hard caps
+├─ engine/
+│  ├─ agent_registry.py        # SoA table, brain list, buckets, mutations
+│  ├─ ego_frame.py             # heading8, rotate rays, unrotate logits
+│  ├─ ego_tick_adapter.py      # runtime adapter API for ticks
+│  ├─ game/move_mask.py        # action masks (A=17/41), bounds + unit gating
+│  ├─ ray_engine/raycaster2d.py# fast 8‑dir raycast (alt: first‑hit features)
+│  ├─ grid.py                  # grid init, device/dtype assertions
+│  └─ mapgen.py                # walls, heal zones, capture points (CP)
+├─ config.py                   # single source of knobs (dtype/device/ranges/sizes)
+├─ scripts/                    # run/train utilities (optional launcher)
+└─ tests/                      # unit/property tests for contracts & hot paths
+```
 
-Asynchronous I/O: Simulation statistics and logs are written to disk by a separate process, ensuring that file I/O never blocks the main simulation loop.
+> If you maintain a legacy branch (`codex_bellum`), keep **ABI contracts identical** so entry‑points/visualizers can be shared.
 
-🚀 Getting Started
-Prerequisites
-Python 3.9+
+---
 
-PyTorch 2.0+ (CUDA or MPS enabled for GPU acceleration)
+## 4. Installation & Environment 🧰
 
-pygame (for UI mode)
+### 4.1 Prerequisites
 
-imageio (for video recording)
+* Windows 11, Python 3.10.x, CUDA 12.x
+* NVIDIA RTX 3060 (6 GB) and Intel i7‑10750H
+* PyTorch ≥ 2.1 (CUDA build)
 
-Installation
-Clone the repository:
+### 4.2 Setup
 
-git clone [https://github.com/your-username/Codex-Bellum.git](https://github.com/your-username/Codex-Bellum.git)
-cd Codex-Bellum
+```bash
+# clone
+git clone https://github.com/<you>/battle_simulation.git
+cd battle_simulation
 
-Install dependencies:
+# (optional) create venv
+python -m venv .venv && .\.venv\Scripts\activate
 
+# install deps (edit requirements as needed)
 pip install -r requirements.txt
 
-(Note: Ensure your PyTorch installation is correct for your specific hardware. See the official PyTorch website).
+# editable install
+pip install -e .
+```
 
-Running the Simulation
-The simulation is launched via the main entry point.
+### 4.3 Quick Run
 
-python -m final_war_sim.main
+```bash
+# Run a headless short simulation (example; adapt to your package path)
+python -m final_war_sim.scripts.run_sim --ticks 2000 --grid 128 128 --agents 1000
 
-Headless Mode (for training / servers)
-By default, the simulation runs in headless mode if UI dependencies are not met or if explicitly disabled.
+# Or, if on the legacy branch name
+python -m codex_bellum.main
+```
 
-# Run a headless simulation, disabling the UI
-FWS_UI=0 python -m final_war_sim.main
+> If you use a Pygame viewer, ensure SDL video drivers are available; otherwise run headless with recording disabled.
 
-Results, logs, and statistics will be saved to a timestamped directory in results/.
+---
 
-UI Mode (for visualization)
-If pygame is installed, the UI will run by default.
+## 5. Configuration (Knobs) ⚙️
 
-# Run with the interactive UI
-FWS_UI=1 python -m final_war_sim.main
+All knobs reside in **`config.py`** and are read once at import time. **Do not** read config dynamically inside hot loops. Example baseline:
 
-Controls:
+```python
+# Device & numerics
+TORCH_DEVICE      = torch.device("cuda")
+TORCH_DTYPE       = torch.float16      # AMP‑friendly
+AMP_ENABLED       = True               # autocast in PPO / eval
 
-Pan: WASD / Arrow Keys
+# Grid & agents
+GRID_WIDTH        = 128
+GRID_HEIGHT       = 128
+MAX_AGENTS        = 2048
+MAX_HP            = 1.0
 
-Zoom: Mouse Wheel
+# Actions & units
+NUM_ACTIONS       = 41                 # 17 or 41
+ARCHER_RANGE      = 4                  # 1..4
+UNIT_SOLDIER      = 1
+UNIT_ARCHER       = 2
 
-Select Agent: Left Click
+# Rays (first‑hit features)
+RAYCAST_MAX_STEPS = 10
+RAY_PE_DIM        = 4                  # 0 disables positional encoding
+RAY_ATTN_DIM      = 16                 # 0 disables tiny attention
 
-Mark Agent: M (when an agent is selected)
+# Map generation
+RANDOM_WALLS      = 24
+WALL_SEG_MIN      = 4
+WALL_SEG_MAX      = 18
+WALL_AVOID_MARGIN = 4
+HEAL_ZONE_COUNT   = 2
+HEAL_ZONE_SIZE_RATIO = 0.04
 
-Copy Brain: C (saves selected agent's brain to copied_brain.pth)
+# Mutation / evolution (gentle)
+MAX_PARAMS_PER_BRAIN     = 40_000
+PRUNE_SOFT_BUDGET        = 35_000
+MUTATION_WIDEN_PROB      = 0.30     # widen fc2 by +1..+2 occasionally
+MUTATION_TWEAK_PROB      = 0.70     # tiny Gaussian noise on ~0.3% weights
+MUTATION_TWEAK_FRAC      = 0.003
+MUTATION_TWEAK_STD       = 0.01
+MUTATION_FRACTION_ALIVE  = 0.10
 
-Trigger Mutation: E (manually triggers mutation for ~10% of agents)
+# Ego‑frame
+RELATIVE_DIRS     = True            # enable rotate/unrotate machinery
+```
 
-Quit: ESC
+**How to adapt:**
 
-🛠️ Configuration
-The simulation's behavior is deeply configurable via environment variables. This allows for rapid experimentation without code changes.
+* **Throughput first:** lower `RAY_ATTN_DIM` to 0 (disable attention) and/or `RAY_PE_DIM` to 0 to maximize FPS.
+* **Smarter agents:** increase `RAY_PE_DIM` (ring PE richness) and small `RAY_ATTN_DIM` (e.g., 8..16) for better directional context.
+* **Combat density:** increase `MAX_AGENTS` cautiously; budget per‑tick memory and ensure batch sizes (per bucket) remain ≥ 64.
+* **Action richness:** switch to `NUM_ACTIONS=41` only if ranged combat matters; masking cost and sampling overhead increase.
 
-Variable
+---
 
-Default
+## 6. Agent Brain & Heads 🧩
 
-Description
+### 6.1 Actor‑Critic Brain
 
-FWS_GRID_W
+A tiny **MLP trunk** with stable Xavier/Kaiming init, explicit **float32 cast on inputs** (AMP safety), and a **RayEncoder** for the first 64 dims.
 
-128
+* **Input:** `(B, F=85)`
+* **RayEncoder:** per‑ray Linear(8→16) → optional **RingPositionalEncoding** (dim=`RAY_PE_DIM`) → optional **TinyRayAttention** (dim=`RAY_ATTN_DIM`) → flatten → Linear → **32‑dim** ray context.
+* **Rich features:** concatenated `(B, 21)`
+* **Trunk:** Linear→SiLU×3
+* **Heads:** `actor: Linear(h, A)` and `critic: Linear(h, 1)`
 
-Width of the simulation world.
+**Why tiny attention?** With only 8 slots, a single head (`attn_dim≤16`) captures symmetry and salient directions without blowing up latency.
 
-FWS_GRID_H
+### 6.2 Factorized Directional Heads
 
-128
+`idle` (scalar) + **8‑wide groups** for move/melee/ranged. This preserves a **single categorical action space** while keeping logits organized by direction. Enables **cheap unrotation** and mask application.
 
-Height of the simulation world.
+**Output:** `logits: (B, A)` and `value: (B,)` (value kept **1‑D** even for `B=1` to avoid cat() scalars in batching).
 
-FWS_START_PER_TEAM
+### 6.3 Ensemble Forward (Per‑Bucket)
 
-900
+`ensemble_forward(models, obs)` iterates over K models for a bucket, slices `(1,F)` per model, and concatenates outputs to `(K, A)` and `(K,)`. It normalizes "dist‑like" heads (object with `.logits`) and guards value shape to **never** be 0‑D.
 
-Number of agents to spawn for each team at the start.
+**Tuning guidance:** When most agents share the same topology (typical), bucket sizes are large and throughput is high. Avoid heterogeneous topologies unless evolution is aggressive.
 
-FWS_MAX_AGENTS
+---
 
-3000
+## 7. Ego‑Frame Runtime 🎯
 
-Hard capacity limit for the AgentsRegistry.
+**Heading selection** prioritizes: (1) actual displacement; else (2) nearest visible **enemy** ray; else (3) sticky previous heading.
 
-FWS_TICK_LIMIT
+* `rotate_obs64_inplace`: rotates only the **first 64 dims** so ray index 0 aligns with heading (ego‑centric).
+* `unrotate_logits_inplace`: inverses rotation on **each 8‑wide group** (moves, melee, each ranged ring) to keep global action indices.
 
-0
+**Do not** rotate non‑directional columns (idle, scalar features). Tests enforce that partial groups (<8) are left unrotated.
 
-If > 0, simulation will stop after this many ticks.
+---
 
-FWS_AMP
+## 8. Action Masks 🔐
 
-1
+`build_mask(pos_xy, teams, grid, unit)` outputs `(N, A)` bool masks:
 
-Enable Automatic Mixed Precision (0 to disable).
+* **Move**: in‑bounds and **free** cells only (occ=0).
+* **Melee (A≥17)**: neighbor cell contains **enemy** (team mismatch; ignore walls/ally).
+* **Ranged (A=41)**: DIRS8 × r=1..4; unit gating: **Soldier→r=1**, **Archer→r≤ARCHER\_RANGE**.
+* **Idle** always permitted.
 
-FWS_SEED
+Keep masks cheap: integer math for indices, single channel reads, and bulk writes per 8‑wide block to avoid scatter overhead.
 
-None
+---
 
-Set a global seed for reproducibility.
+## 9. Raycasting 🔦
 
-FWS_PPO_TICKS
+Two patterns are supported:
 
-20
+1. **First‑hit features** (recommended for V2): one‑hot class + normalized distance + hp at first collision per ray. Output **(N,64)**.
+2. **Scanline sampling** (alt): densified `(N, 8×S×2)` of occ/hp per step where S=`RAYCAST_MAX_STEPS`. Use only for richer models; higher memory bandwidth.
 
-How often (in ticks) to run a PPO training update.
+Normalize distances by **per‑agent vision cap** to keep features comparable across units.
 
-FWS_MUTATE_EVERY
+---
 
-2000
+## 10. Agents Registry & Bucketing 🗂️
 
-How often (in ticks) to run a genetic mutation cycle.
+A single **SoA tensor** `(MAX_AGENTS, NUM_COLS)` holds all agents. Brains live in a parallel Python list (kept off the tensor for contiguity). The registry:
 
-FWS_UI
+* Tracks **alive** state, `(x,y)`, `team`, `hp`, `atk`, and `unit id`.
+* Builds **buckets** by architecture signature (e.g., concatenated Linear/Conv shapes).
+* Applies **mutations** in‑place using pluggable `mutate_fn`.
 
-1
+**Why SoA?** Contiguous columnar slices vectorize better (fewer cache misses) and simplify batched dispatch.
 
-Enable the Pygame UI (0 to disable).
+---
 
-FWS_TARGET_FPS
+## 11. Mutation & Evolution 🧬
 
-60
+**Gentle mutation** to avoid parameter explosion:
 
-Target frames-per-second for the UI.
+* (1) Small Gaussian noise to a tiny fraction of weights (`~0.3%`).
+* (2) Rare micro‑widen of `fc2` by +1..+2 neurons, then rewire actor/critic inputs.
+* (3) Structured prune (drop smallest‑norm rows) if over budget.
+* **Hard cap:** `MAX_PARAMS_PER_BRAIN`.
 
-🔬 Research & Philosophy
-Codex-Bellum is more than a codebase; it is a tool for inquiry. It can be used to explore fundamental questions in artificial intelligence and complex systems:
+**Why gentle?** Keeps per‑agent forward pass cheap and preserves bucket homogeneity, improving overall FPS.
 
-How do coordinated, strategic behaviors emerge from decentralized, individual learning?
+---
 
-What is the interplay between short-term optimization (RL) and long-term structural adaptation (EAs)?
+## 12. Tick Loop Integration 🔄
 
-Can diverse and specialized agent roles (e.g., scouts, defenders, attackers) evolve naturally within a homogenous population?
+Typical high‑level pseudocode:
 
-How do environmental pressures and map topologies shape the evolution of tactics?
+```python
+# Pre-allocate runtime helpers
+registry = AgentsRegistry(grid)
+ego = EgoFrameRuntime(capacity=registry.capacity, device=device)
 
-This project is built with the hope that by creating a sufficiently complex and competitive digital ecosystem, we can observe the sparks of a truly emergent, artificial intelligence.
+for t in range(T):
+    alive_idx = ...                        # Long[K]
+    pos_xy    = registry.positions_xy(alive_idx)
+    teams     = registry.agent_data[alive_idx, COL_TEAM]
 
-🤝 Contributing
-Contributions are welcome. Please open an issue to discuss your ideas or submit a pull request.
+    # Build obs V2: rays (64) + rich (21)
+    rays64    = raycast8_firsthit(pos_xy, grid, unit_map)
+    obs       = torch.cat([rays64, rich21], dim=1)
 
-📜 License
-This project is licensed under the MIT License. See the LICENSE file for details.
+    # Ego rotation
+    obs_ego   = ego.rotate_obs64_inplace(alive_idx, pos_xy, teams, obs)
 
-<div align="center">
-<p><b>Forged in the fires of digital conflict.</b></p>
-</div>
+    # Bucketing & per-bucket forward
+    buckets   = registry.build_buckets(alive_idx)
+    logits    = torch.empty((0, A), device=device)
+    values    = torch.empty((0,), device=device)
+    for B in buckets:
+        oB = obs_ego.index_select(0, B.indices)
+        distB, valB = ensemble_forward(B.models, oB)
+        logB = ego.unrotate_logits_inplace(B.indices, distB.logits)
+        logits = torch.cat([logits, logB], dim=0)
+        values = torch.cat([values, valB], dim=0)
+
+    # Mask → sample → step engine
+    mask      = build_mask(pos_xy, teams, grid, unit=registry.units(alive_idx))
+    actions   = sample(logits, mask)
+    step_engine(actions, registry, grid)
+
+    # Optional evolution
+    mutants   = pick_mutants(alive_idx)
+    registry.apply_mutations(mutants, mutate_model_inplace)
+```
+
+---
+
+## 13. Performance Playbook ⚡
+
+### 13.1 Fast Path Principles
+
+* **Avoid Python control** in inner loops; precompute indices and use vector operations.
+* **Batch by bucket** to amortize kernel launch overhead.
+* **Keep tensors contiguous** and on the same `device`/`dtype`; assert via guards early.
+* **Prefer float16 compute** under AMP; cast model inputs to float32 *once* at head.
+
+### 13.2 Hot Knobs
+
+* `RAY_ATTN_DIM = 0` → disable attention; boosts FPS.
+* `RAY_PE_DIM = 0` → no ring PE; smallest RayEncoder.
+* `NUM_ACTIONS = 17` → narrow head & mask; cheaper sampling.
+* **Grid size** and **agent count** dominate memory traffic; tune first.
+
+### 13.3 GPU Memory Budgeting
+
+* Ray features `(K,64)` are small; avoid large stepwise scan tensors unless needed.
+* Ensure per‑bucket batch size **≥ 64** to keep SMs busy.
+* Track parameter counts; evolution must respect `MAX_PARAMS_PER_BRAIN`.
+
+---
+
+## 14. Observability & Logging 📈
+
+Recommended metrics (per tick or window):
+
+* Action distribution histograms (per group; detect degenerate policies).
+* Mask hit‑rates (move feasibility, enemy‑in‑range %) per unit type.
+* Entropy of policy outputs; KL vs. previous tick for stability.
+* Evolution logs: brain param counts, widen/prune events, generation.
+* Perf counters: ticks/s, forward ms, mask ms, raycast ms.
+
+Emit JSONL/CSV with stable field names for dashboards.
+
+---
+
+## 15. Testing Strategy 🧪
+
+* **Unit tests** for: DIRS8 order, rotation/unrotation, mask correctness on synthetic boards, RayEncoder shapes.
+* **Property tests**: rotate→unrotate = identity for all 8‑wide groups; masks remain within bounds under random placements.
+* **Numerics**: value head returns **1‑D** always; AMP path equivalence vs. float32 within tolerance.
+
+Run: `pytest -q` in the project root.
+
+---
+
+## 16. Extending the Engine 🔧
+
+### 16.1 Add a Unit Type
+
+1. Define new unit id in `config.py`.
+2. Extend **type encoding** in raycaster (add classes if visible distinction is needed).
+3. Update **mask** rules for new unit’s ranged/melee constraints.
+4. Add unit‑type column to registry (if new stats required).
+
+### 16.2 Change Action Space
+
+* For **A=49 (DIRS8 × r=1..5)**: keep **8‑wide group contract**. Update `_group_slices_for_actions()` and mask writer to emit 5‑column blocks per dir. Tests must pin layout.
+
+### 16.3 Replace the Brain
+
+* Maintain **I/O contract**: `(B,F) → (logits(B,A), value(B,1 or B))`. Keep `.logits` attribute if returning a dist wrapper.
+* Reuse **FactorizedDirectionalHeads** to preserve unrotation logic and mask compatibility.
+
+### 16.4 Richer Perception
+
+* Swap first‑hit rays for **scanline** encoding; adjust `RayEncoder` to handle `(8×S×2)` reshaping and compress to 32‑64 dims.
+
+---
+
+## 17. PPO Training (Optional) 🎓
+
+* Use centralized experience buffers; per‑agent brains can still be independent if weights are cloned per bucket per update.
+* **AMP on** by default; cast observations to float16 in buffers and promote to float32 at model ingress.
+* Clip ratios and entropy bonuses should be tracked by **unit type** to detect niche collapse (e.g., archers disappearing).
+
+> If you train off‑policy or with evolutionary strategies, keep policy evaluation API identical for drop‑in replacement.
+
+---
+
+## 18. Determinism & Reproducibility 🧪
+
+* Seed Python, NumPy, and Torch; set `torch.backends.cudnn.deterministic = True` when benchmarking algorithmic changes (note: may reduce raw FPS).
+* Fix initialization schemes; avoid time‑based seeding in mutation.
+* Persist **config + seed + git sha** in run metadata directories.
+
+---
+
+## 19. Troubleshooting 🛠️
+
+* **`ModuleNotFoundError`**: ensure `pip install -e .` and correct package path (`final_war_sim` vs `codex_bellum`).
+* **Viewer cannot open writer**: disable recording or install required codecs; run headless for profiling.
+* **Agents not learning strategy**: verify mask correctness, action entropy, and that ranged groups are reachable; increase `ARCHER_RANGE` or map open spaces.
+* **Extinction of unit types**: add mild curriculum (spawn balance), or lower mutation amplitude; track unit population over time.
+
+---
+
+## 20. Roadmap 🧭
+
+* **Capture points** scoring every N ticks with area control masks.
+* **Metabolism drain** to reduce camping; reward shaping for activity.
+* **Bucket‑aware JIT** (TorchScript/torch.compile) for steady topologies.
+* **Triton kernels** for mask/raycast inner loops (optional).
+
+---
+
+## 21. License & Citation 📜
+
+Choose a permissive license (e.g., MIT) for community contributions. When publishing, please cite **WarSim Pro** and include the commit SHA and configuration snapshot used to produce results.
+
+---
+
+## 22. Quick Reference (Cheat Sheet) 🗂️
+
+* **Directions:** DIRS8 = `[N, NE, E, SE, S, SW, W, NW]`
+* **Actions (A=41):** `idle | move×8 | melee×8 | ranged(r=1..4)×8`
+* **Obs (F=85):** `rays64 (8×[onehot6, dist, hp]) + rich21`
+* **Grid:** `(3,H,W)` with `occ/hp/agent_id`
+* **Heads:** factorized; 8‑wide groups must rotate/unrotate together
+* **Mutation:** gentle; cap params; prefer noise→micro‑widen→prune
+* **Knobs:** `RAY_PE_DIM`, `RAY_ATTN_DIM`, `NUM_ACTIONS`, `ARCHER_RANGE`, `RAYCAST_MAX_STEPS`
+
+---
+
+### Final Note
+
+This codebase is intended to be **surgically modular**. Preserve the ABI contracts and the engine will remain swappable, testable, and fast under growth. Maintain small, stable brains for throughput; use evolution sparingly; measure everything.
