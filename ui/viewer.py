@@ -6,11 +6,11 @@ import torch
 import torch.nn as nn
 import numpy as np
 
-from .. import config
-from ..simulation.stats import TEAM_RED, TEAM_BLUE
+import config
+from simulation.stats import TEAM_RED, TEAM_BLUE
 from .camera import Camera
-from ..engine.agent_registry import COL_ALIVE, COL_TEAM, COL_UNIT
-from ..agent.mutation import pick_mutants, mutate_model_inplace
+from engine.agent_registry import COL_ALIVE, COL_TEAM, COL_UNIT
+from agent.mutation import pick_mutants, mutate_model_inplace
 
 FONT_NAME = "consolas"
 

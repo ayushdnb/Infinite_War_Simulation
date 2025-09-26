@@ -1,7 +1,7 @@
 # final_war_sim/engine/ray_engine/raycaster2d.py
 from __future__ import annotations
 import torch
-from ... import config
+import config
 
 # Grid channels
 # 0: occupancy (0 empty, 1 wall, 2 red, 3 blue)

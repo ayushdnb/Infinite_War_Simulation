@@ -8,7 +8,7 @@ import copy
 import torch
 import torch.jit
 
-from .. import config
+import config
 from .agent_registry import (
     AgentsRegistry,
     COL_ALIVE, COL_TEAM, COL_X, COL_Y, COL_HP, COL_ATK, COL_UNIT,
@@ -20,7 +20,7 @@ except Exception:
     TEAM_RED_ID = 2.0
     TEAM_BLUE_ID = 3.0
 
-from ..agent.brain import ActorCriticBrain, scripted_brain
+from agent.brain import ActorCriticBrain, scripted_brain
 
 # ----------------------------
 # Config knobs (safe fallbacks)

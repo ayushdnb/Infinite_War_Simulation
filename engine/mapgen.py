@@ -5,7 +5,7 @@ from typing import List, Tuple
 import random
 import torch
 
-from .. import config
+import config
 
 # Grid channels:
 #   0: occupancy (0 empty, 1 wall, 2 red, 3 blue)

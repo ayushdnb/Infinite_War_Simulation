@@ -2,8 +2,7 @@ from __future__ import annotations
 from typing import Optional
 import torch
 
-# Import config from project root (two levels up from engine/ray_engine)
-from ... import config
+import config
 
 # Grid channels:
 #   0: occupancy (0 empty, 1 wall, 2 red, 3 blue)

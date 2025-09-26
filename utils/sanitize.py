@@ -1,7 +1,7 @@
 # final_war_sim/utils/sanitize.py
 from __future__ import annotations
 import torch
-from .. import config
+import config
 
 def assert_finite_tensor(t: torch.Tensor, name: str) -> None:
     if not torch.isfinite(t).all():

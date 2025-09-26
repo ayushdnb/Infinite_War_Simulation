@@ -15,21 +15,21 @@ except Exception:
     cv2 = None
 
 # PPO (package-local)
-from .rl.ppo import PerAgentPPO
+from rl.ppo import PerAgentPPO
 
 # Local modules
-from . import config
-from .simulation.stats import SimulationStats
-from .engine.agent_registry import AgentsRegistry
-from .engine.tick import TickEngine
-from .engine.grid import make_grid, assert_on_same_device
-from .engine.spawn import spawn_uniform_random, spawn_symmetric
-from .engine.respawn import respawn_some
-from .engine.mapgen import add_random_walls, make_zones
-from .utils.sanitize import runtime_sanity_check
-from .utils.persistence import ResultsWriter
-from .utils.profiler import torch_profiler_ctx, nvidia_smi_summary
-from .ui.viewer import Viewer
+import config
+from simulation.stats import SimulationStats
+from engine.agent_registry import AgentsRegistry
+from engine.tick import TickEngine
+from engine.grid import make_grid, assert_on_same_device
+from engine.spawn import spawn_uniform_random, spawn_symmetric
+from engine.respawn import respawn_some
+from engine.mapgen import add_random_walls, make_zones
+from utils.sanitize import runtime_sanity_check
+from utils.persistence import ResultsWriter
+from utils.profiler import torch_profiler_ctx, nvidia_smi_summary
+from ui.viewer import Viewer
 
 
 # ------------------------------- helpers -------------------------------

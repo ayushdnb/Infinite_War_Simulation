@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Dict, List
 import time
 
-from .. import config
+import config
 
 TEAM_RED  = "red"
 TEAM_BLUE = "blue"

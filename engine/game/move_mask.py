@@ -1,7 +1,7 @@
 # codex_bellum/engine/game/move_mask.py
 from __future__ import annotations
 import torch
-from ... import config
+import config
 
 # 8 directions (dx, dy): N, NE, E, SE, S, SW, W, NW
 DIRS8 = torch.tensor([

@@ -5,13 +5,12 @@ import random
 from typing import Optional, Tuple
 
 import torch
-
-from .. import config
+import config
 from .agent_registry import (
     AgentsRegistry,
     COL_TEAM, COL_X, COL_Y, COL_UNIT, COL_ALIVE,
 )
-from ..agent.brain import scripted_brain, ActorCriticBrain
+from agent.brain import scripted_brain, ActorCriticBrain
 
 # ---------------------------------------------------------------------
 # Helpers

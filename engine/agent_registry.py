@@ -4,8 +4,7 @@ from dataclasses import dataclass
 from typing import List, Dict, Optional
 import torch
 import torch.nn as nn
-
-from .. import config
+import config
 
 # ================================================================
 # Column layout (Struct-of-Arrays for GPU efficiency)

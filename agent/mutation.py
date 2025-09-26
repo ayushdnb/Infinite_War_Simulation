@@ -6,7 +6,7 @@ import random
 import torch
 import torch.nn as nn
 
-from .. import config
+import config
 
 # ---------------- Config (safe defaults; override in config.py) ----------------
 MAX_PARAMS_PER_BRAIN       = getattr(config, "MAX_PARAMS_PER_BRAIN", 40_000)   # hard ceiling

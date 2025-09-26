@@ -4,8 +4,8 @@ from typing import Dict, Optional, List, Tuple, TYPE_CHECKING
 
 import torch
 
-from .. import config
-from ..simulation.stats import SimulationStats, TEAM_RED, TEAM_BLUE
+import config
+from simulation.stats import SimulationStats, TEAM_RED, TEAM_BLUE
 from .agent_registry import (
     AgentsRegistry, COL_ALIVE, COL_TEAM, COL_X, COL_Y, COL_HP, COL_ATK, COL_UNIT,
 )
@@ -15,8 +15,8 @@ from .game.move_mask import build_mask, DIRS8
 from .respawn import RespawnController
 from .mapgen import Zones  # optional; all uses guarded
 
-from ..agent.ensemble import ensemble_forward
-from ..agent.mutation import pick_mutants, mutate_model_inplace
+from agent.ensemble import ensemble_forward
+from agent.mutation import pick_mutants, mutate_model_inplace
 
 from .ego_frame import (
     compute_heading8,
