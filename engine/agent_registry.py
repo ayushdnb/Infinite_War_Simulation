@@ -1,4 +1,3 @@
-# final_war_sim/engine/agent_registry.py
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Dict, Optional
@@ -46,6 +45,8 @@ class AgentsRegistry:
       - agent_data: (MAX_AGENTS, NUM_COLS) tensor
         columns: [alive, team, x, y, hp, atk, unit]
       - brains: list[nn.Module | None], length MAX_AGENTS
+      - hp_max: (MAX_AGENTS,) tensor for per-agent max health
+      - vision_range: (MAX_AGENTS,) tensor for per-agent vision range
     """
 
     def __init__(self, grid: torch.Tensor) -> None:
@@ -64,6 +65,10 @@ class AgentsRegistry:
         # Brains are stored separately (keeps SoA tensor dense/contiguous)
         self.brains: List[Optional[nn.Module]] = [None] * self.capacity
 
+        # Per-agent attributes not in the main tensor
+        self.hp_max = torch.full((self.capacity,), float(config.MAX_HP), dtype=config.TORCH_DTYPE, device=self.device)
+        self.vision_range = torch.full((self.capacity,), int(config.RAYCAST_MAX_STEPS), dtype=torch.float32, device=self.device)
+
         # (Optional) generation counters, if you want to track evolution lineage
         self.generations: List[int] = [0] * self.capacity
 
@@ -76,6 +81,8 @@ class AgentsRegistry:
         self.agent_data[:, COL_ALIVE] = 0.0
         self.brains = [None] * self.capacity
         self.generations = [0] * self.capacity
+        self.hp_max.fill_(float(config.MAX_HP))
+        self.vision_range.fill_(int(config.RAYCAST_MAX_STEPS))
 
     def register(
         self,
@@ -105,6 +112,12 @@ class AgentsRegistry:
         d[slot, COL_UNIT]  = float(unit)
         self.brains[slot]  = brain.to(self.device)
         self.generations[slot] = int(generation)
+
+        # Set per-agent attributes
+        self.hp_max[slot] = float(config.MAX_HP)
+        vision_map = getattr(config, "VISION_RANGE_BY_UNIT", {})
+        default_vis = int(getattr(config, "RAYCAST_MAX_STEPS", 10))
+        self.vision_range[slot] = vision_map.get(int(unit), default_vis)
 
     def kill(self, slots: torch.Tensor) -> None:
         """Mark agents dead (grid clearing happens in TickEngine)."""

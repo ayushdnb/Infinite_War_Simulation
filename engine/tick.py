@@ -188,24 +188,19 @@ class TickEngine:
         pos_xy = self.registry.positions_xy(alive_idx)
         unit_map = build_unit_map(data, self.grid)
 
-        vision_map = getattr(config, "VISION_RANGE_BY_UNIT", {1: 6, 2: 10})
-        default_vis = int(getattr(config, "RAYCAST_MAX_STEPS", max(vision_map.values()) if len(vision_map) else 10))
-        units_here = data[alive_idx, COL_UNIT].to(torch.long)
-        max_steps_each = torch.full((units_here.numel(),), int(default_vis), device=self.device, dtype=torch.long)
-        for uid, vis in vision_map.items():
-            uid_i = int(uid); vis_i = int(vis)
-            if vis_i < 0:
-                continue
-            mask = (units_here == uid_i)
-            if mask.any():
-                max_steps_each[mask] = vis_i
+        # Use per-agent vision range from the registry
+        max_steps_each = self.registry.vision_range[alive_idx].to(self.device, dtype=torch.long)
 
         rays = raycast8_firsthit(pos_xy, self.grid, unit_map, max_steps_each=max_steps_each)  # (N,64)
 
         N = alive_idx.numel()
         x = data[alive_idx, COL_X] / float(self.W - 1)
         y = data[alive_idx, COL_Y] / float(self.H - 1)
-        hp = data[alive_idx, COL_HP] / float(self._MAX_HP)
+        
+        # Normalize HP by per-agent max_hp
+        hp_max = self.registry.hp_max[alive_idx].clamp_min(1e-6)
+        hp = data[alive_idx, COL_HP] / hp_max
+
         team = data[alive_idx, COL_TEAM]
         unit = data[alive_idx, COL_UNIT]
 
@@ -469,7 +464,9 @@ class TickEngine:
             on_heal = heal[ay, ax]
             if torch.any(on_heal):
                 healers = alive_idx[on_heal]
-                data[healers, COL_HP] = torch.clamp(data[healers, COL_HP] + self._HEAL_RATE, max=self._MAX_HP)
+                healers_max_hp = self.registry.hp_max[healers]
+                new_hp = data[healers, COL_HP] + self._HEAL_RATE
+                data[healers, COL_HP] = torch.minimum(new_hp, healers_max_hp)
                 hx = self._as_long(data[healers, COL_X]); hy = self._as_long(data[healers, COL_Y])
                 self.grid[1][hy, hx] = data[healers, COL_HP]
 
@@ -480,7 +477,7 @@ class TickEngine:
             drain_s = torch.tensor(self._META_SOLDIER, dtype=data.dtype, device=self.device)
             drain_a = torch.tensor(self._META_ARCHER,  dtype=data.dtype, device=self.device)
             drain = torch.where(units_here == 1, drain_s, drain_a)
-            data[alive_idx, COL_HP] = torch.clamp(data[alive_idx, COL_HP] - drain, min=0.0, max=self._MAX_HP)
+            data[alive_idx, COL_HP] = (data[alive_idx, COL_HP] - drain).clamp(min=0.0)
             self.grid[1][ay, ax] = data[alive_idx, COL_HP]
             was_alive = data[:, COL_ALIVE] > 0.5
             now_dead = (data[:, COL_HP] <= 0.0) & was_alive

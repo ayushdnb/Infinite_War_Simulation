@@ -1,4 +1,3 @@
-# codex_bellum/engine/respawn.py
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional, Tuple
@@ -215,35 +214,14 @@ def _unit_stats(unit_id: int) -> Tuple[float, float]:
         return SOLDIER_HP, SOLDIER_ATK
 
 
-def _write_agent_row(
-    reg: AgentsRegistry, grid: torch.Tensor, slot: int,
-    team_id: float, x: int, y: int, unit_id: int, hp: float, atk: float, brain: torch.nn.Module
-) -> None:
-    # Grid
-    grid[0, y, x] = float(team_id)
-    grid[1, y, x] = float(hp)
-    grid[2, y, x] = float(slot)
-
-    # Table
-    reg.agent_data[slot, COL_TEAM]  = float(team_id)
-    reg.agent_data[slot, COL_X]     = float(x)
-    reg.agent_data[slot, COL_Y]     = float(y)
-    reg.agent_data[slot, COL_UNIT]  = float(unit_id)
-    reg.agent_data[slot, COL_HP]    = float(hp)
-    reg.agent_data[slot, COL_ATK]   = float(atk)
-    reg.agent_data[slot, COL_ALIVE] = 1.0
-
-    # Brain
-    reg.brains[slot] = brain
-
-
 @torch.no_grad()
-def _respawn_some(reg: AgentsRegistry, grid: torch.Tensor, team_id: float, count: int) -> int:
+def _respawn_some(reg: AgentsRegistry, grid: torch.Tensor, team_id: float, count: int, respawn_counter: int) -> int:
     """
     Wave-friendly respawn:
       - uniform/frontline placement with wall margin
       - mix fresh brain and (lightly noised) clone brain per RESP_CLONE_PROB
       - unit mix Soldier/Archer via SPAWN_ARCHER_RATIO
+      - includes a rare mutation check every 1000 spawns.
     """
     if count <= 0:
         return 0
@@ -270,6 +248,19 @@ def _respawn_some(reg: AgentsRegistry, grid: torch.Tensor, team_id: float, count
         # Unit & stats
         unit_id = _choose_unit()
         hp0, atk0 = _unit_stats(unit_id)
+        vision_map = getattr(config, "VISION_RANGE_BY_UNIT", {})
+        default_vis = int(getattr(config, "RAYCAST_MAX_STEPS", 10))
+        vision0 = float(vision_map.get(int(unit_id), default_vis))
+        hp_max0 = float(config.MAX_HP)
+
+        # RARE MUTATION CHECK
+        if (respawn_counter + spawned + 1) % 1000 == 0:
+            print(f"INFO: Rare mutation triggered for agent {slot} at respawn count {respawn_counter + spawned + 1}")
+            # Coefficients for super soldier or abhorrence
+            hp_max0 *= random.uniform(0.5, 3.0)
+            vision0 *= random.uniform(0.5, 2.0)
+            atk0 *= random.uniform(0.5, 3.0)
+            hp0 = hp_max0
 
         # Brain
         use_clone = (parents.numel() > 0) and (random.random() < RESP_CLONE_PROB)
@@ -281,7 +272,27 @@ def _respawn_some(reg: AgentsRegistry, grid: torch.Tensor, team_id: float, count
         else:
             brain = _new_brain(device)
 
-        _write_agent_row(reg, grid, slot, team_id, x, y, unit_id, hp0, atk0, brain)
+        # --- Write agent to grid and registry ---
+        # Grid
+        grid[0, y, x] = float(team_id)
+        grid[1, y, x] = float(hp0)
+        grid[2, y, x] = float(slot)
+
+        # Table
+        reg.agent_data[slot, COL_TEAM]  = float(team_id)
+        reg.agent_data[slot, COL_X]     = float(x)
+        reg.agent_data[slot, COL_Y]     = float(y)
+        reg.agent_data[slot, COL_UNIT]  = float(unit_id)
+        reg.agent_data[slot, COL_HP]    = float(hp0)
+        reg.agent_data[slot, COL_ATK]   = float(atk0)
+        reg.agent_data[slot, COL_ALIVE] = 1.0
+
+        # Per-agent attributes
+        reg.hp_max[slot] = hp_max0
+        reg.vision_range[slot] = vision0
+
+        # Brain
+        reg.brains[slot] = brain
         spawned += 1
 
     return spawned
@@ -296,9 +307,12 @@ class RespawnController:
         self._cooldown_red_until  = 0
         self._cooldown_blue_until = 0
         self._last_period_tick    = 0
+        self.total_respawns       = 0
 
     def _spawn_team(self, reg: AgentsRegistry, grid: torch.Tensor, team_id: float, k: int) -> int:
-        return _respawn_some(reg, grid, team_id, k) if k > 0 else 0
+        spawned = _respawn_some(reg, grid, team_id, k, self.total_respawns) if k > 0 else 0
+        self.total_respawns += spawned
+        return spawned
 
     def step(self, tick: int, reg: AgentsRegistry, grid: torch.Tensor) -> Tuple[int, int]:
         counts = _team_counts(reg)
@@ -333,4 +347,6 @@ class RespawnController:
 # Back-compat simple API
 def respawn_some(registry: AgentsRegistry, grid: torch.Tensor, team_is_red: bool, count: int) -> int:
     team_id = TEAM_RED_ID if team_is_red else TEAM_BLUE_ID
-    return _respawn_some(registry, grid, team_id, count)
+    # Note: this legacy API doesn't participate in the global respawn counter for rare mutations.
+    # It's recommended to use the RespawnController.
+    return _respawn_some(registry, grid, team_id, count, -1) # -1 indicates it's outside the counter
