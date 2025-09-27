@@ -8,21 +8,29 @@ import config
 # ================================================================
 # Column layout (Struct-of-Arrays for GPU efficiency)
 # ================================================================
-COL_ALIVE = 0  # float: 1.0 alive, 0.0 dead
-COL_TEAM  = 1  # float: 2.0 red, 3.0 blue
-COL_X     = 2  # float: x coordinate
-COL_Y     = 3  # float: y coordinate
-COL_HP    = 4  # float: health points
-COL_ATK   = 5  # float: attack power
-COL_UNIT  = 6  # float: 1.0 = Soldier, 2.0 = Archer
+COL_ALIVE = 0       # float: 1.0 alive, 0.0 dead
+COL_TEAM  = 1       # float: 2.0 red, 3.0 blue
+COL_X     = 2       # float: x coordinate
+COL_Y     = 3       # float: y coordinate
+COL_HP    = 4       # float: current health points
+COL_UNIT  = 5       # float: 1.0 = Soldier, 2.0 = Archer
+# --- New Per-Agent Attribute Columns ---
+COL_HP_MAX = 6      # float: maximum health points for this agent
+COL_VISION = 7      # float: vision range in cells for this agent
+COL_ATK    = 8      # float: attack power for this agent
 
-NUM_COLS = int(config.AGENT_FEATURES)  # keep single source of truth
+# Update the total number of features
+NUM_COLS = 9 
+
+# Ensure config matches this new layout if it's used elsewhere
+if hasattr(config, 'AGENT_FEATURES'):
+    config.AGENT_FEATURES = NUM_COLS
 
 TEAM_RED_ID  = 2.0
 TEAM_BLUE_ID = 3.0
 
-UNIT_SOLDIER = float(config.UNIT_SOLDIER)
-UNIT_ARCHER  = float(config.UNIT_ARCHER)
+UNIT_SOLDIER = float(getattr(config, "UNIT_SOLDIER", 1.0))
+UNIT_ARCHER  = float(getattr(config, "UNIT_ARCHER", 2.0))
 
 # ================================================================
 # Buckets: allow grouping agents with same NN architecture
@@ -40,13 +48,6 @@ class AgentsRegistry:
     """
     Stores all agents in the simulation as a big tensor (SoA layout).
     Mirrors: grid occupancy channel -> registry rows.
-
-    Owns:
-      - agent_data: (MAX_AGENTS, NUM_COLS) tensor
-        columns: [alive, team, x, y, hp, atk, unit]
-      - brains: list[nn.Module | None], length MAX_AGENTS
-      - hp_max: (MAX_AGENTS,) tensor for per-agent max health
-      - vision_range: (MAX_AGENTS,) tensor for per-agent vision range
     """
 
     def __init__(self, grid: torch.Tensor) -> None:
@@ -62,27 +63,21 @@ class AgentsRegistry:
         )
         self.agent_data[:, COL_ALIVE] = 0.0
 
-        # Brains are stored separately (keeps SoA tensor dense/contiguous)
+        # Brains are stored separately
         self.brains: List[Optional[nn.Module]] = [None] * self.capacity
-
-        # Per-agent attributes not in the main tensor
-        self.hp_max = torch.full((self.capacity,), float(config.MAX_HP), dtype=config.TORCH_DTYPE, device=self.device)
-        self.vision_range = torch.full((self.capacity,), int(config.RAYCAST_MAX_STEPS), dtype=torch.float32, device=self.device)
-
-        # (Optional) generation counters, if you want to track evolution lineage
         self.generations: List[int] = [0] * self.capacity
 
-    # ------------------------------------------------------------
-    # Basic ops
-    # ------------------------------------------------------------
+        # Add column constants as instance attributes for easy access
+        self.COL_ALIVE, self.COL_TEAM, self.COL_X, self.COL_Y, self.COL_HP, self.COL_UNIT = 0, 1, 2, 3, 4, 5
+        self.COL_HP_MAX, self.COL_VISION, self.COL_ATK = 6, 7, 8
+
+
     def clear(self) -> None:
         """Reset all agents (keeps capacity)."""
         self.agent_data.zero_()
         self.agent_data[:, COL_ALIVE] = 0.0
         self.brains = [None] * self.capacity
         self.generations = [0] * self.capacity
-        self.hp_max.fill_(float(config.MAX_HP))
-        self.vision_range.fill_(int(config.RAYCAST_MAX_STEPS))
 
     def register(
         self,
@@ -94,12 +89,13 @@ class AgentsRegistry:
         hp: float,
         atk: float,
         brain: nn.Module,
-        unit: float | int = UNIT_SOLDIER,
+        unit: float | int,
+        hp_max: float,
+        vision_range: int,
         generation: int = 0,
     ) -> None:
         """
-        Put an agent into a fixed slot (caller manages slot selection).
-        Safe to call for both initial spawns and respawns.
+        Put an agent into a fixed slot with all its attributes.
         """
         assert 0 <= slot < self.capacity
         d = self.agent_data
@@ -110,14 +106,10 @@ class AgentsRegistry:
         d[slot, COL_HP]    = float(hp)
         d[slot, COL_ATK]   = float(atk)
         d[slot, COL_UNIT]  = float(unit)
+        d[slot, COL_HP_MAX] = float(hp_max)
+        d[slot, COL_VISION]= float(vision_range)
         self.brains[slot]  = brain.to(self.device)
         self.generations[slot] = int(generation)
-
-        # Set per-agent attributes
-        self.hp_max[slot] = float(config.MAX_HP)
-        vision_map = getattr(config, "VISION_RANGE_BY_UNIT", {})
-        default_vis = int(getattr(config, "RAYCAST_MAX_STEPS", 10))
-        self.vision_range[slot] = vision_map.get(int(unit), default_vis)
 
     def kill(self, slots: torch.Tensor) -> None:
         """Mark agents dead (grid clearing happens in TickEngine)."""
@@ -125,22 +117,12 @@ class AgentsRegistry:
             return
         self.agent_data[slots, COL_ALIVE] = 0.0
 
-    # ------------------------------------------------------------
-    # Views
-    # ------------------------------------------------------------
     def positions_xy(self, indices: torch.Tensor) -> torch.Tensor:
         """Return LongTensor [(N,2)] of XY positions for given indices."""
         x = self.agent_data[indices, COL_X].to(torch.long)
         y = self.agent_data[indices, COL_Y].to(torch.long)
         return torch.stack((x, y), dim=1)
 
-    def units(self, indices: torch.Tensor) -> torch.Tensor:
-        """Return (N,) float tensor of unit ids (1.0 = Soldier, 2.0 = Archer)."""
-        return self.agent_data[indices, COL_UNIT]
-
-    # ------------------------------------------------------------
-    # Bucketing by architecture
-    # ------------------------------------------------------------
     @staticmethod
     def _signature(model: nn.Module) -> str:
         """Create a cheap architecture fingerprint (MLP-friendly)."""
@@ -149,9 +131,6 @@ class AgentsRegistry:
             for _, m in model.named_modules():
                 if isinstance(m, nn.Linear):
                     sig_parts.append(f"L({m.in_features},{m.out_features})")
-                elif isinstance(m, nn.Conv2d):
-                    k = m.kernel_size if isinstance(m.kernel_size, tuple) else (m.kernel_size, m.kernel_size)
-                    sig_parts.append(f"C({m.in_channels},{m.out_channels},{k})")
         except Exception:
             pass
         return "|".join(sig_parts)
@@ -170,31 +149,8 @@ class AgentsRegistry:
         out: List[Bucket] = []
         for key, lst in buckets_dict.items():
             idx = torch.tensor(lst, dtype=torch.long, device=self.device)
-            models = [self.brains[j] for j in lst]
-            out.append(Bucket(signature=key, indices=idx, models=models))
+            models = [self.brains[j] for j in lst if j < len(self.brains) and self.brains[j] is not None]
+            if models:
+              out.append(Bucket(signature=key, indices=idx, models=models))
         return out
 
-    # ------------------------------------------------------------
-    # Mutation hook
-    # ------------------------------------------------------------
-    def apply_mutations(self, indices: torch.Tensor, mutate_fn) -> None:
-        """
-        Apply structural mutations in-place.
-        mutate_fn(model: nn.Module) -> nn.Module
-        """
-        if indices is None or indices.numel() == 0:
-            return
-        for i in indices.tolist():
-            m = self.brains[i]
-            if m is None:
-                continue
-            self.brains[i] = mutate_fn(m).to(self.device)
-
-    # ------------------------------------------------------------
-    # Optional helpers used by UI
-    # ------------------------------------------------------------
-    def get_agent_generation(self, agent_id: int) -> int:
-        try:
-            return int(self.generations[agent_id])
-        except Exception:
-            return 0

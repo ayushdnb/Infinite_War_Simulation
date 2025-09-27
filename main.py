@@ -1,4 +1,3 @@
-# final_war_sim/main.py
 from __future__ import annotations
 
 import os
@@ -14,34 +13,18 @@ try:
 except Exception:
     cv2 = None
 
-# PPO (package-local)
-from rl.ppo import PerAgentPPO
-
-# Local modules
+# Local modules - changed to absolute imports
 import config
 from simulation.stats import SimulationStats
 from engine.agent_registry import AgentsRegistry
 from engine.tick import TickEngine
 from engine.grid import make_grid, assert_on_same_device
-from engine.spawn import spawn_uniform_random, spawn_symmetric
-from engine.respawn import respawn_some
+from engine.spawn import spawn_symmetric, spawn_uniform_random
 from engine.mapgen import add_random_walls, make_zones
-from utils.sanitize import runtime_sanity_check
 from utils.persistence import ResultsWriter
-from utils.profiler import torch_profiler_ctx, nvidia_smi_summary
 from ui.viewer import Viewer
 
-
 # ------------------------------- helpers -------------------------------
-
-def _env_flag(name: str, default: str = "0") -> bool:
-    return os.getenv(name, default).lower() in {"1", "true", "yes"}
-
-def _env_int(name: str, default: int) -> int:
-    try:
-        return int(os.getenv(name, str(default)))
-    except Exception:
-        return default
 
 def _config_snapshot() -> dict:
     """Light, serializable snapshot of current config for run metadata."""
@@ -57,13 +40,13 @@ def _config_snapshot() -> dict:
         "BASE_ATK": config.BASE_ATK,
         "AMP": config.amp_enabled() if hasattr(config, "amp_enabled") else False,
         "PPO": {
-            "UPDATE_TICKS": config.PPO_UPDATE_TICKS,
-            "LR": config.PPO_LR,
-            "EPOCHS": config.PPO_EPOCHS,
-            "CLIP": config.PPO_CLIP,
-            "ENTROPY": config.PPO_ENTROPY_BONUS,
-            "VCOEF": config.PPO_VALUE_COEF,
-            "MAX_GN": config.PPO_MAX_GRAD_NORM,
+            "UPDATE_TICKS": getattr(config, "PPO_UPDATE_TICKS", 5),
+            "LR": getattr(config, "PPO_LR", 3e-4),
+            "EPOCHS": getattr(config, "PPO_EPOCHS", 3),
+            "CLIP": getattr(config, "PPO_CLIP", 0.2),
+            "ENTROPY": getattr(config, "PPO_ENTROPY_BONUS", 0.01),
+            "VCOEF": getattr(config, "PPO_VALUE_COEF", 0.5),
+            "MAX_GN": getattr(config, "PPO_MAX_GRAD_NORM", 1.0),
         },
         "REWARDS": {
             "KILL": config.TEAM_KILL_REWARD,
@@ -78,7 +61,7 @@ def _config_snapshot() -> dict:
             "TARGET_FPS": config.TARGET_FPS,
         },
         "SPAWN": {
-            "SPAWN_ARCHER_RATIO": float(getattr(config, "SPAWN_ARCHER_RATIO", os.getenv("FWS_SPAWN_ARCHER_RATIO", 0.4))),
+            "SPAWN_ARCHER_RATIO": float(getattr(config, "SPAWN_ARCHER_RATIO", 0.4)),
         },
         "ARCHER_LOS_BLOCKS_WALLS": bool(getattr(config, "ARCHER_LOS_BLOCKS_WALLS", False)),
     }
@@ -89,78 +72,58 @@ def _seed_all_from_env() -> Optional[int]:
         return None
     try:
         seed = int(raw)
-    except Exception:
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+        np.random.seed(seed)
+        return seed
+    except (ValueError, TypeError):
         return None
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-    np.random.seed(seed)
-    return seed
-
 
 # --------------------------- simple video recorder ---------------------------
 
-RECORD_VIDEO   = getattr(config, "RECORD_VIDEO", True)
-VIDEO_FPS      = getattr(config, "VIDEO_FPS", 30)
-VIDEO_SCALE    = getattr(config, "VIDEO_SCALE", 4)
-VIDEO_EVERY_TICKS = 1  # record every tick
-
 class _SimpleRecorder:
-    """
-    Minimal recorder that always works on Windows.
-    Uses MJPG codec (baked into OpenCV builds) → AVI file.
-    """
-    def __init__(self, run_dir: str, grid: torch.Tensor, fps: int = 30, scale: int = 4):
+    def __init__(self, run_dir: str, grid: torch.Tensor, fps: int, scale: int):
         self.enabled = False
-        self.grid = grid
-        self.path = None
-        self.size = None
-        self.writer = None
-
-        if not RECORD_VIDEO or cv2 is None:
+        if not getattr(config, "RECORD_VIDEO", False) or cv2 is None:
             return
-
-        base = os.path.basename(run_dir.rstrip("\\/"))
-        self.path = os.path.join(run_dir, f"{base}_raw.avi")
 
         H, W = int(grid.size(1)), int(grid.size(2))
         self.size = (W * scale, H * scale)
-
+        self.path = os.path.join(run_dir, "simulation_raw.avi")
         fourcc = cv2.VideoWriter_fourcc(*"MJPG")
-        writer = cv2.VideoWriter(self.path, fourcc, fps, self.size)
+        self.writer = cv2.VideoWriter(self.path, fourcc, float(fps), self.size)
 
-        if writer.isOpened():
-            self.writer = writer
+        if self.writer.isOpened():
             self.enabled = True
-            print(f"[video] recording → {self.path} (codec=MJPG AVI, fps={fps}, scale={scale}x)")
+            print(f"[video] recording → {self.path}")
+            self.palette = np.array([
+                [30, 30, 30], [80, 80, 80], [220, 80, 80], [80, 120, 240]
+            ], dtype=np.uint8)
+            self.grid = grid
         else:
-            print(f"[video] ERROR: could not open writer for {self.path}; recording disabled.")
-
-        self.palette = np.array([
-            [30, 30, 30],   # empty
-            [80, 80, 80],   # wall
-            [50, 50, 220],  # red
-            [220, 120, 50], # blue
-        ], dtype=np.uint8)
+            print(f"[video] ERROR: could not open writer for {self.path}.")
 
     def write(self):
-        if not self.enabled:
-            return
-        occ = self.grid[0].to("cpu").numpy().astype(np.uint8)
+        if not self.enabled: return
+        occ = self.grid[0].cpu().numpy().astype(np.uint8)
         frame = self.palette[occ]
-        frame = cv2.resize(frame, self.size, interpolation=cv2.INTER_NEAREST)
-        self.writer.write(frame)
+        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        frame_resized = cv2.resize(frame_bgr, self.size, interpolation=cv2.INTER_NEAREST)
+        self.writer.write(frame_resized)
 
     def close(self):
-        if self.enabled and self.writer is not None:
+        if self.enabled and self.writer:
             self.writer.release()
             print(f"[video] saved → {self.path}")
-
 
 # ------------------------------ run loops ------------------------------
 
 def _headless_loop(engine, stats, reg, grid, rw, limit: int) -> None:
-    from .utils.profiler import torch_profiler_ctx, nvidia_smi_summary
+    # Import here to avoid circular dependency issues at top-level
+    from utils.profiler import torch_profiler_ctx, nvidia_smi_summary
+    from utils.sanitize import runtime_sanity_check
+
     with torch_profiler_ctx() as prof:
         try:
             while limit == 0 or stats.tick < limit:
@@ -169,11 +132,13 @@ def _headless_loop(engine, stats, reg, grid, rw, limit: int) -> None:
                 deaths = stats.drain_dead_log()
                 if deaths:
                     rw.write_deaths(deaths)
+                
                 if (stats.tick % 500) == 0:
-                    from .utils.sanitize import runtime_sanity_check
                     runtime_sanity_check(grid, reg.agent_data)
+                
                 if prof is not None:
                     prof.step()
+                
                 if (stats.tick % 100) == 0:
                     gpu = nvidia_smi_summary() or "-"
                     print(
@@ -183,7 +148,6 @@ def _headless_loop(engine, stats, reg, grid, rw, limit: int) -> None:
                     )
         except KeyboardInterrupt:
             print("\n[main] Interrupted — shutting down gracefully.")
-
 
 # --------------------------------- main --------------------------------
 
@@ -195,104 +159,63 @@ def main() -> None:
 
     print(config.summary_str())
 
-    # Build world
     grid = make_grid(config.TORCH_DEVICE)
     registry = AgentsRegistry(grid)
     stats = SimulationStats()
 
-    # Add thin gray walls BEFORE spawning
-    add_random_walls(grid,
-                     n_segments=config.RANDOM_WALLS,
-                     seg_min=config.WALL_SEG_MIN,
-                     seg_max=config.WALL_SEG_MAX,
-                     avoid_margin=config.WALL_AVOID_MARGIN)
-
-    # Zones (heal & capture)
-    H, W = int(grid.size(1)), int(grid.size(2))
-    zones = make_zones(H, W, device=config.TORCH_DEVICE)
-
-    # Spawn both teams uniformly across map with Soldier/Archer mix
+    add_random_walls(grid)
+    zones = make_zones(config.GRID_HEIGHT, config.GRID_WIDTH, device=config.TORCH_DEVICE)
+    
     spawn_mode = os.getenv("FWS_SPAWN_MODE", "uniform").lower()
-    if spawn_mode.startswith("sym"):
+    if spawn_mode == "symmetric":
         spawn_symmetric(registry, grid, per_team=config.START_AGENTS_PER_TEAM)
     else:
         spawn_uniform_random(registry, grid, per_team=config.START_AGENTS_PER_TEAM)
 
-    assert_on_same_device(grid, registry.agent_data)
-
-    # Engine (pass zones to enable heal & capture scoring)
     engine = TickEngine(registry, grid, stats, zones=zones)
 
-    # PPO window scaffold (optional, preserved)
-    ppo = PerAgentPPO(registry)
-    ppo.begin_window(stats.snapshot())
-
-    # Persistence
     rw = ResultsWriter()
     run_dir = rw.start(config_obj=_config_snapshot())
     print(f"[main] Results → {run_dir}")
 
-    # Video recorder (optional)
-    recorder = _SimpleRecorder(run_dir, grid, fps=VIDEO_FPS, scale=VIDEO_SCALE)
+    recorder = _SimpleRecorder(
+        run_dir, grid, 
+        fps=getattr(config, "VIDEO_FPS", 30), 
+        scale=getattr(config, "VIDEO_SCALE", 4)
+    )
+    
     _orig_run_tick = engine.run_tick
-
     def _run_tick_with_recording():
         _orig_run_tick()
-        if recorder.enabled and (stats.tick % VIDEO_EVERY_TICKS) == 0:
+        if recorder.enabled and (stats.tick % getattr(config, "VIDEO_EVERY_TICKS", 1) == 0):
             recorder.write()
-
     engine.run_tick = _run_tick_with_recording
-
-    # Run (UI or headless)
-    try:
-        signal.signal(signal.SIGINT, signal.getsignal(signal.SIGINT))
-    except Exception:
-        pass
 
     try:
         if config.ENABLE_UI:
             viewer = Viewer(grid, cell_size=config.CELL_SIZE)
-            # Some older Viewer builds have slightly different signatures; keep both paths safe.
-            try:
-                viewer.run(engine, registry, stats, tick_limit=config.TICK_LIMIT, target_fps=config.TARGET_FPS)
-            except TypeError:
-                viewer.run(engine, registry, stats, tick_limit=config.TICK_LIMIT)
+            viewer.run(engine, registry, stats, tick_limit=config.TICK_LIMIT, target_fps=config.TARGET_FPS)
         else:
             _headless_loop(engine, stats, registry, grid, rw, limit=config.TICK_LIMIT)
     except KeyboardInterrupt:
         print("\n[main] Interrupted — flushing logs…")
     finally:
-        try:
+        # Graceful shutdown for persistence
+        if rw:
             deaths = stats.drain_dead_log()
-            if deaths:
-                rw.write_deaths(deaths)
-        except Exception:
-            pass
-        try:
-            final_summary = {
+            if deaths: rw.write_deaths(deaths)
+            summary = {
                 "final_tick": stats.tick,
-                "elapsed_seconds": getattr(stats, "elapsed_seconds", None),
-                "scores": {"red": getattr(stats.red, "score", None), "blue": getattr(stats.blue, "score", None)},
-                "cp": {"red": getattr(stats.red, "cp_points", 0.0), "blue": getattr(stats.blue, "cp_points", 0.0)},
+                "elapsed_seconds": stats.elapsed_seconds,
+                "scores": {"red": stats.red.score, "blue": stats.blue.score},
             }
-            with open(os.path.join(run_dir, "summary.json"), "w", encoding="utf-8") as f:
-                json.dump(final_summary, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
-        try:
-            recorder.close()
-        except Exception:
-            pass
-        try:
+            with open(os.path.join(run_dir, "summary.json"), "w") as f:
+                json.dump(summary, f, indent=2)
             rw.close()
-        except Exception:
-            pass
+        if recorder:
+            recorder.close()
         print("[main] Shutdown complete.")
 
-
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        print(f"[main] Fatal error: {type(e).__name__}: {e}", file=sys.stderr)
-        raise
+    main()
+

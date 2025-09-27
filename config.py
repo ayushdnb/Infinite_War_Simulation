@@ -120,13 +120,13 @@ ARCHER_LOS_BLOCKS_WALLS = _env_bool("FWS_ARCHER_BLOCK_LOS", False)
 # Metabolism (HP drain per tick)
 # ================================================================
 METABOLISM_ENABLED = _env_bool("FWS_META_ON", True)
-META_SOLDIER_HP_PER_TICK = _env_float("FWS_META_SOLDIER", 0.0001)  # ~500 ticks from 1.00
-META_ARCHER_HP_PER_TICK  = _env_float("FWS_META_ARCHER",  0.00001)  # tuned vs 0.70 base
+META_SOLDIER_HP_PER_TICK = _env_float("FWS_META_SOLDIER", 0.001)  # ~500 ticks from 1.00
+META_ARCHER_HP_PER_TICK  = _env_float("FWS_META_ARCHER",  0.0006)  # tuned vs 0.70 base
 
 # ================================================================
 # Respawn knobs
 # ================================================================
-RESPAWN_COOLDOWN_TICKS   = _env_int("FWS_RESPAWN_CD", 1000)
+RESPAWN_COOLDOWN_TICKS   = _env_int("FWS_RESPAWN_CD", 500)
 RESPAWN_BATCH_PER_TEAM   = _env_int("FWS_RESPAWN_BATCH", 2)
 RESPAWN_ARCHER_SHARE     = _env_float("FWS_RESPAWN_ARCHER_SHARE", 0.50)  # 35% archer
 RESPAWN_INTERIOR_BIAS    = _env_float("FWS_RESPAWN_INTERIOR_BIAS", 0.75)
@@ -135,16 +135,16 @@ RESPAWN_JITTER_RADIUS    = _env_int("FWS_RESPAWN_JITTER", 5)
 # ================================================================
 # Random Walls (thin, gray)
 # ================================================================
-RANDOM_WALLS      = _env_int("FWS_RAND_WALLS", 8)   # segments
+RANDOM_WALLS      = _env_int("FWS_RAND_WALLS", 25)   # segments
 WALL_SEG_MIN      = _env_int("FWS_WALL_SEG_MIN", 12)
-WALL_SEG_MAX      = _env_int("FWS_WALL_SEG_MAX", 30)
+WALL_SEG_MAX      = _env_int("FWS_WALL_SEG_MAX", 100)
 WALL_AVOID_MARGIN = _env_int("FWS_WALL_AVOID_MARGIN", 1)  # cells from border
 
 # ================================================================
 # Heal Zones (rects, scaled to grid)
 # ================================================================
-HEAL_ZONE_COUNT      = _env_int("FWS_HEAL_COUNT", 5)
-HEAL_ZONE_SIZE_RATIO = _env_float("FWS_HEAL_SIZE_RATIO", 30/256)
+HEAL_ZONE_COUNT      = _env_int("FWS_HEAL_COUNT", 7)
+HEAL_ZONE_SIZE_RATIO = _env_float("FWS_HEAL_SIZE_RATIO", 40/256)
 HEAL_RATE            = _env_float("FWS_HEAL_RATE", 0.02)      # HP/tick, clamped
 
 # ================================================================
@@ -159,7 +159,7 @@ CP_REWARD_PER_TICK = _env_float("FWS_CP_REWARD", 0.05)
 # ================================================================
 TEAM_KILL_REWARD       = _env_float("FWS_REW_KILL",       1.0)
 TEAM_DMG_DEALT_REWARD  = _env_float("FWS_REW_DMG_DEALT",  0.00)
-TEAM_DEATH_PENALTY     = _env_float("FWS_REW_DEATH",     -0.03)
+TEAM_DEATH_PENALTY     = _env_float("FWS_REW_DEATH",     -0.4)
 TEAM_DMG_TAKEN_PENALTY = _env_float("FWS_REW_DMG_TAKEN",  0.00)
 
 # ================================================================
@@ -202,7 +202,7 @@ PPO_ENABLED = True
 
 # Rewards
 PPO_REWARD_KILL = 1.0
-PPO_REWARD_DEATH = -0.3
+PPO_REWARD_DEATH = -0.4
 
 # PPO knobs (safe defaults)
 PPO_WINDOW_TICKS = 20

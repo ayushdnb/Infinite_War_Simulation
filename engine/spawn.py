@@ -1,4 +1,3 @@
-# final_war_sim/engine/spawn.py
 from __future__ import annotations
 import math
 import random
@@ -6,179 +5,159 @@ from typing import Optional, Tuple
 
 import torch
 import config
-from .agent_registry import (
-    AgentsRegistry,
-    COL_TEAM, COL_X, COL_Y, COL_UNIT, COL_ALIVE,
-)
-from agent.brain import scripted_brain, ActorCriticBrain
-
-# ---------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------
+from .agent_registry import AgentsRegistry
+# Import the new brain
+from agent.transformer_brain import TransformerBrain, scripted_transformer_brain
 
 def _rect_dims(n: int, max_cols: int, max_rows: int) -> Tuple[int, int, int]:
-    """
-    Choose (cols, rows, n_eff) for a compact rectangle within max_cols x max_rows
-    that can place at least n agents if possible.
-    """
-    if max_cols <= 0 or max_rows <= 0 or n <= 0:
-        return 0, 0, 0
+    """Calculates dimensions for a compact rectangle to place n agents."""
+    if n <= 0: return 0, 0, 0
     cols = min(max_cols, max(1, int(math.sqrt(n))))
-    rows = int(math.ceil(n / cols))
-    if rows > max_rows:
-        rows = max_rows
-        cols = min(max_cols, int(math.ceil(n / rows)))
+    rows = min(max_rows, int(math.ceil(n / cols)))
     n_eff = min(n, cols * rows)
     return cols, rows, n_eff
 
-
-def _mk_brain():
-    """
-    If PPO is enabled, return an eager nn.Module (trainable).
-    Otherwise, return a TorchScript scripted brain (fast inference).
-    """
+def _mk_brain(device: torch.device):
+    """Creates a new TransformerBrain instance."""
+    obs_dim = (64 * 8) + 21
+    act_dim = int(getattr(config, "NUM_ACTIONS", 41))
     if bool(getattr(config, "PPO_ENABLED", False)):
-        model = ActorCriticBrain(config.OBS_DIM, config.NUM_ACTIONS, hidden=64)
-        return model.to(getattr(config, "TORCH_DEVICE", torch.device("cpu")))
+        return TransformerBrain(obs_dim, act_dim).to(device)
     else:
-        return scripted_brain(config.OBS_DIM, config.NUM_ACTIONS, hidden=64).to(getattr(config, "TORCH_DEVICE", torch.device("cpu")))
-
-
+        return scripted_transformer_brain(obs_dim, act_dim).to(device)
 
 def _choose_unit(is_archer_prob: float) -> float:
     return float(config.UNIT_ARCHER if random.random() < is_archer_prob else config.UNIT_SOLDIER)
 
-
-def _unit_stats(unit_val: float) -> Tuple[float, float]:
-    """Return (hp, atk) for the given unit id (float)."""
+def _unit_stats(unit_val: float) -> Tuple[float, float, int]:
+    """Returns (hp, atk, vision) for a given unit id."""
+    vision_map = getattr(config, "VISION_RANGE_BY_UNIT", {})
     if int(unit_val) == int(config.UNIT_ARCHER):
-        return float(config.ARCHER_HP), float(config.ARCHER_ATK)
+        hp = float(config.ARCHER_HP)
+        atk = float(config.ARCHER_ATK)
+        vision = int(vision_map.get(config.UNIT_ARCHER, 15))
     else:
-        return float(config.SOLDIER_HP), float(config.SOLDIER_ATK)
+        hp = float(config.SOLDIER_HP)
+        atk = float(config.SOLDIER_ATK)
+        vision = int(vision_map.get(config.UNIT_SOLDIER, 10))
+    return hp, atk, vision
 
-
-# --- helpers ------------------------------------------------------------------
-def _place_if_free(reg: AgentsRegistry, grid: torch.Tensor, slot: int, *, team_is_red: bool, x: int, y: int, unit_val: float) -> bool:
-    occ = grid[0]
-    if occ[y, x] != 0.0:
+def _place_if_free(
+    reg: AgentsRegistry, grid: torch.Tensor, slot: int, *,
+    team_is_red: bool, x: int, y: int, unit_val: float
+) -> bool:
+    """Places an agent if the cell is free and registers it."""
+    if grid[0, y, x] != 0.0:
         return False
-    # place on grid
-    grid[0][y, x] = 2.0 if team_is_red else 3.0
-    grid[1][y, x] = 1.0  # start HP
-    grid[2][y, x] = float(slot)
-
-    # write agent row
-    reg.agent_data[slot, COL_TEAM] = 2.0 if team_is_red else 3.0
-    reg.agent_data[slot, COL_X] = float(x)
-    reg.agent_data[slot, COL_Y] = float(y)
-    reg.agent_data[slot, COL_UNIT] = float(unit_val)
-    reg.agent_data[slot, COL_ALIVE] = 1.0
-
-    # attach a fresh brain (per-agent)
-    brain = _mk_brain()
-    reg.brains[slot] = brain
+    
+    hp, atk, vision = _unit_stats(unit_val)
+    
+    # Register agent with its new attributes
+    reg.register(
+        slot,
+        team_is_red=team_is_red,
+        x=x, y=y,
+        hp=hp,
+        atk=atk,
+        brain=_mk_brain(reg.device),
+        unit=unit_val,
+        hp_max=hp,
+        vision_range=vision,
+        generation=1
+    )
+    
+    # Update grid
+    grid[0, y, x] = 2.0 if team_is_red else 3.0
+    grid[1, y, x] = hp
+    grid[2, y, x] = float(slot)
     return True
 
-
-# ---------------------------------------------------------------------
-# Public spawners
-# ---------------------------------------------------------------------
-
 def spawn_symmetric(reg: AgentsRegistry, grid: torch.Tensor, per_team: int) -> None:
-    """
-    Rectangular formations on opposite sides:
-      - RED rectangle on left half
-      - BLUE rectangle on right half
-    Spawns a mix of Soldiers/Archers per team using SPAWN_ARCHER_RATIO.
-    """
+    """Spawns agents in symmetric rectangular formations on opposite sides."""
     H, W = grid.size(1), grid.size(2)
-    margin = 1  # keep borders clear (outer walls)
+    margin = 2
     half_w = W // 2
+    placeable_w = half_w - margin
+    placeable_h = H - 2 * margin
 
-    # Capacity guards
-    per_team_cap = reg.capacity // 2
-    per_team_grid_cap = max(0, (half_w - 2) * (H - 2))
-    per_team_eff = max(0, min(per_team, per_team_cap, per_team_grid_cap))
-    if per_team_eff <= 0:
-        return
+    per_team_eff = min(per_team, reg.capacity // 2, placeable_w * placeable_h)
+    if per_team_eff <= 0: return
 
-    # Archer mix
-    try:
-        ar_ratio = float(getattr(config, "SPAWN_ARCHER_RATIO", os.getenv("FWS_SPAWN_ARCHER_RATIO", 0.4)))
-    except Exception:
-        ar_ratio = 0.4
-    ar_ratio = max(0.0, min(1.0, ar_ratio))
+    ar_ratio = float(getattr(config, "SPAWN_ARCHER_RATIO", 0.4))
 
-    # Red rectangle (left half)
-    red_max_cols = max(1, half_w - 2)
-    red_max_rows = max(1, H - 2)
-    r_cols, r_rows, r_n = _rect_dims(per_team_eff, red_max_cols, red_max_rows)
-    red_x0 = margin
-    red_y0 = margin
+    # Red team (left)
+    r_cols, r_rows, r_n = _rect_dims(per_team_eff, placeable_w, placeable_h)
+    red_x0, red_y0 = margin, (H - r_rows) // 2
 
-    # Blue rectangle (right half)
-    blue_max_cols = max(1, half_w - 2)
-    blue_max_rows = max(1, H - 2)
-    b_cols, b_rows, b_n = _rect_dims(per_team_eff, blue_max_cols, blue_max_rows)
-    blue_x0 = W - margin - b_cols
-    blue_y0 = margin
-
+    # Blue team (right)
+    b_cols, b_rows, b_n = _rect_dims(per_team_eff, placeable_w, placeable_h)
+    blue_x0, blue_y0 = W - margin - b_cols, (H - b_rows) // 2
+    
     slot = 0
-
-    # RED (row-major)
-    placed = 0
+    # Place Red
     for iy in range(r_rows):
-        if placed >= r_n or slot >= reg.capacity:
-            break
         for ix in range(r_cols):
-            if placed >= r_n or slot >= reg.capacity:
-                break
+            if slot >= r_n or slot >= reg.capacity: break
             x, y = red_x0 + ix, red_y0 + iy
             unit = _choose_unit(ar_ratio)
             if _place_if_free(reg, grid, slot, team_is_red=True, x=x, y=y, unit_val=unit):
                 slot += 1
-                placed += 1
+        if slot >= r_n or slot >= reg.capacity: break
 
-    # BLUE (row-major)
-    placed = 0
+    # Place Blue
+    blue_start_slot = slot
     for iy in range(b_rows):
-        if placed >= b_n or slot >= reg.capacity:
-            break
         for ix in range(b_cols):
-            if placed >= b_n or slot >= reg.capacity:
-                break
+            if slot >= blue_start_slot + b_n or slot >= reg.capacity: break
             x, y = blue_x0 + ix, blue_y0 + iy
             unit = _choose_unit(ar_ratio)
             if _place_if_free(reg, grid, slot, team_is_red=False, x=x, y=y, unit_val=unit):
                 slot += 1
-                placed += 1
+        if slot >= blue_start_slot + b_n or slot >= reg.capacity: break
 
-
-# --- public API ---------------------------------------------------------------
-def spawn_uniform_random(registry: AgentsRegistry, grid: torch.Tensor, per_team: int, *, unit: float = 1.0) -> None:
-    """
-    Spawn 'per_team' agents for each team at random free cells.
-    """
+def spawn_uniform_random(reg: AgentsRegistry, grid: torch.Tensor, per_team: int) -> None:
+    """Spawns agents for both teams randomly across the entire map for maximum chaos."""
     H, W = grid.size(1), grid.size(2)
-    total = registry.capacity
+    ar_ratio = float(getattr(config, "SPAWN_ARCHER_RATIO", 0.4))
+    
+    total_to_spawn = per_team * 2
+    red_to_spawn = per_team
+    blue_to_spawn = per_team
+    
     slot = 0
+    attempts = 0
+    # Give up after a reasonable number of tries to avoid infinite loops on full maps
+    max_attempts = total_to_spawn * 50 
 
-    # start red
-    team_is_red = True
-    for _ in range(per_team):
-        for _try in range(1000):
-            x = torch.randint(0, W//2, ()).item()
-            y = torch.randint(0, H, ()).item()
-            if _place_if_free(registry, grid, slot, team_is_red=team_is_red, x=x, y=y, unit_val=unit):
-                slot += 1
-                break
+    while slot < total_to_spawn and attempts < max_attempts and slot < reg.capacity:
+        # Pick a random location anywhere on the grid (respecting a 1-cell border)
+        x = random.randint(1, W - 2)
+        y = random.randint(1, H - 2)
+        
+        # Decide which team to try and spawn for this cell
+        # This logic ensures we spawn teams randomly until one quota is met, then fill the other.
+        spawn_red = (red_to_spawn > 0 and blue_to_spawn == 0) or \
+                    (red_to_spawn > 0 and blue_to_spawn > 0 and random.random() < 0.5)
+        
+        # Check if the cell is actually free before attempting to place
+        if grid[0, y, x] == 0.0:
+            team_placed = False
+            if spawn_red and red_to_spawn > 0:
+                unit = _choose_unit(ar_ratio)
+                if _place_if_free(reg, grid, slot, team_is_red=True, x=x, y=y, unit_val=unit):
+                    slot += 1
+                    red_to_spawn -= 1
+                    team_placed = True
+            # Check the other team if the first pick was invalid or its quota was full
+            elif not spawn_red and blue_to_spawn > 0:
+                unit = _choose_unit(ar_ratio)
+                if _place_if_free(reg, grid, slot, team_is_red=False, x=x, y=y, unit_val=unit):
+                    slot += 1
+                    blue_to_spawn -= 1
+                    team_placed = True
+        
+        attempts += 1
+    
+    if slot < total_to_spawn:
+        print(f"[spawn] Warning: Could only spawn {slot}/{total_to_spawn} agents. The map might be too full.")
 
-    # start blue
-    team_is_red = False
-    for _ in range(per_team):
-        for _try in range(1000):
-            x = torch.randint(W//2, W, ()).item()
-            y = torch.randint(0, H, ()).item()
-            if _place_if_free(registry, grid, slot, team_is_red=team_is_red, x=x, y=y, unit_val=unit):
-                slot += 1
-                break
