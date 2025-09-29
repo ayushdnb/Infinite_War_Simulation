@@ -40,9 +40,14 @@ class TickMetrics:
 
 class TickEngine:
     """
-    Per-tick simulation core using the TransformerBrain / ensemble forward.
-    All assignments to long-lived buffers (registry.agent_data, grid channels)
-    are cast to destination dtype to avoid AMP Half/Float mismatches.
+    Per-tick simulation core using the TransformerBrain and ensemble forward.
+
+    Handles all primary game logic including:
+    - Agent observation building (V2: 64 rays + 21 rich features)
+    - Action sampling via batched model inference
+    - Movement and Combat resolution
+    - Post-action effects: Healing, Metabolism, and Capture Point scoring
+    - PPO data recording with team-based reward shaping
     """
     def __init__(self, registry: AgentsRegistry, grid: torch.Tensor,
                  stats: SimulationStats, zones: Optional[Zones] = None) -> None:
@@ -67,7 +72,7 @@ class TickEngine:
         self._OBS_DIM = (64 * 8) + 21  # rays (64*8) + rich features (21)
         self._MAX_HP = float(getattr(config, "MAX_HP", 1.0))
         self._HEAL_RATE = float(getattr(config, "HEAL_RATE", 0.02))
-        self._CP_REWARD = float(getattr(config, "CP_REWARD_PER_TICK", 5.0))
+        self._CP_REWARD = float(getattr(config, "CP_REWARD_PER_TICK", 0.05)) # Tuned from 5.0
         self._LOS_BLOCKS = bool(getattr(config, "ARCHER_LOS_BLOCKS_WALLS", False))
 
         self._META_ON = bool(getattr(config, "METABOLISM_ENABLED", True))
@@ -271,7 +276,7 @@ class TickEngine:
             o, m = obs[loc], mask[loc]
 
             dist, vals = ensemble_forward(bucket.models, o)
-            logits = dist.logits  # could be half/float depending on AMP
+            logits = dist.logits
 
             # Mask logits, then cast to float32 for Categorical stability
             neg_inf = torch.finfo(logits.dtype).min
@@ -403,15 +408,15 @@ class TickEngine:
         if self._META_ON:
             units_alive = data[alive_idx, COL_UNIT]
             drain = torch.where(units_alive == 1.0,
-                                torch.tensor(self._META_SOLDIER, device=self.device, dtype=self._data_dt),
-                                torch.tensor(self._META_ARCHER, device=self.device, dtype=self._data_dt))
+                                 torch.tensor(self._META_SOLDIER, device=self.device, dtype=self._data_dt),
+                                 torch.tensor(self._META_ARCHER, device=self.device, dtype=self._data_dt))
             data[alive_idx, COL_HP] -= drain
 
             # Update grid HP
             self.grid[1][pos_xy[:, 1].long(), pos_xy[:, 0].long()] = \
                 data[alive_idx, COL_HP].to(self._grid_dt)
 
-            # Deaths from metabolism — pass indices correctly
+            # Deaths from metabolism
             now_dead_from_meta = (data[alive_idx, COL_HP] <= 0.0)
             if now_dead_from_meta.any():
                 dead_from_meta_idx = alive_idx[now_dead_from_meta]
@@ -419,13 +424,42 @@ class TickEngine:
                 combat_red_deaths += rD
                 combat_blue_deaths += bD
 
+        # --- NEW SECTION: CAPTURE POINT SCORING ---
+        if self._z_cp_masks:
+            # Re-fetch alive agents in case of metabolism deaths
+            alive_idx = self._recompute_alive_idx()
+            if alive_idx.numel() > 0:
+                pos_xy_after_meta = self.registry.positions_xy(alive_idx)
+                teams_alive = data[alive_idx, COL_TEAM]
+                is_red_alive = (teams_alive == 2.0)
+                is_blue_alive = (teams_alive == 3.0)
+
+                for cp_mask in self._z_cp_masks:
+                    # Find which agents are on the current capture point
+                    on_cp_mask = cp_mask[pos_xy_after_meta[:, 1].long(), pos_xy_after_meta[:, 0].long()]
+                    
+                    if on_cp_mask.any():
+                        # Count red and blue agents on this point
+                        red_on_cp = (on_cp_mask & is_red_alive).sum()
+                        blue_on_cp = (on_cp_mask & is_blue_alive).sum()
+
+                        if red_on_cp > blue_on_cp:
+                            self.stats.add_capture_points("red", self._CP_REWARD)
+                            metrics.cp_red_tick += self._CP_REWARD
+                        elif blue_on_cp > red_on_cp:
+                            self.stats.add_capture_points("blue", self._CP_REWARD)
+                            metrics.cp_blue_tick += self._CP_REWARD
+        # --- END OF NEW SECTION ---
+
         # PPO record and final updates
         if self._ppo and rec_agent_ids:
             R_kill = float(getattr(config, "PPO_REWARD_KILL", 1.0))
             R_death = float(getattr(config, "PPO_REWARD_DEATH", -0.3))
+            R_cp = float(getattr(config, "CP_REWARD_PER_TICK", 0.05)) # Match CP_REWARD
 
-            team_reward_red = (combat_blue_deaths * R_kill) + (combat_red_deaths * R_death)
-            team_reward_blue = (combat_red_deaths * R_kill) + (combat_blue_deaths * R_death)
+            # Integrate CP points into the team reward
+            team_reward_red = (combat_blue_deaths * R_kill) + (combat_red_deaths * R_death) + metrics.cp_red_tick
+            team_reward_blue = (combat_red_deaths * R_kill) + (combat_blue_deaths * R_death) + metrics.cp_blue_tick
 
             agent_ids = torch.cat(rec_agent_ids)
             done_step = (self.registry.agent_data[agent_ids, COL_ALIVE] <= 0.5)

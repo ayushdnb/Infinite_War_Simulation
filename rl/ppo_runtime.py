@@ -1,10 +1,12 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import torch
 import torch.nn.functional as F
 from torch import nn, optim
+# NEW: Import the learning rate scheduler
+from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from .. import config
 from ..engine.agent_registry import AgentsRegistry
@@ -25,7 +27,7 @@ class PerAgentPPORuntime:
     Minimal per-agent PPO runtime:
       • Tiny replay window per agent (T steps)
       • GAE + clipped PPO updates on each agent's own model
-      • One optimizer per agent (Adam)
+      • One optimizer and LR scheduler per agent (Adam + CosineAnnealingLR)
     """
 
     def __init__(self, registry: AgentsRegistry, device: torch.device, obs_dim: int, act_dim: int):
@@ -44,8 +46,14 @@ class PerAgentPPORuntime:
         self.gamma    = float(getattr(config, "PPO_GAMMA", 0.99))
         self.lam      = float(getattr(config, "PPO_LAMBDA", 0.95))
 
+        # --- NEW: Scheduler hyperparameters ---
+        self.T_max = int(getattr(config, "PPO_LR_T_MAX", 500_000)) # Steps for one decay cycle
+        self.eta_min = float(getattr(config, "PPO_LR_ETA_MIN", 1e-6)) # Minimum learning rate
+
         self._buf: Dict[int, _Buf] = {}
         self._opt: Dict[int, optim.Optimizer] = {}
+        # --- NEW: Dictionary to hold schedulers for each agent ---
+        self._sched: Dict[int, CosineAnnealingLR] = {}
         self._step = 0
 
     def _get_buf(self, aid: int) -> _Buf:
@@ -56,35 +64,34 @@ class PerAgentPPORuntime:
     def _get_opt(self, aid: int, model: nn.Module) -> optim.Optimizer:
         if aid not in self._opt:
             self._opt[aid] = optim.Adam(model.parameters(), lr=self.lr)
+            # --- NEW: Create a scheduler whenever a new optimizer is created ---
+            self._sched[aid] = CosineAnnealingLR(self._opt[aid], T_max=self.T_max, eta_min=self.eta_min)
         return self._opt[aid]
 
     @torch.no_grad()
     def record_step(
         self,
-        agent_ids: torch.Tensor,    # (K,)
-        team_ids: torch.Tensor,     # (K,) float: 2.0 red / 3.0 blue
-        obs: torch.Tensor,          # (K,D)
-        logits: torch.Tensor,       # (K,A) (post-mask, used to sample; may be fp16 under AMP)
-        values: torch.Tensor,       # (K,) or scalar if K==1 (may be fp16 under AMP)
-        actions: torch.Tensor,      # (K,)
+        agent_ids: torch.Tensor,
+        team_ids: torch.Tensor,
+        obs: torch.Tensor,
+        logits: torch.Tensor,
+        values: torch.Tensor,
+        actions: torch.Tensor,
         team_reward_red: float,
         team_reward_blue: float,
-        done: torch.Tensor,         # (K,) bool
+        done: torch.Tensor,
     ) -> None:
         """
         Append a single decision step for all agents in this tick.
         Reward shaping: each agent gets its TEAM reward for this tick.
         """
-        # logp of chosen actions (same dtype as logits; no grad)
-        logp_all = F.log_softmax(logits, dim=-1)                      # (K,A)
-        logp_a = logp_all.gather(1, actions.view(-1, 1)).squeeze(1)   # (K,)
+        logp_all = F.log_softmax(logits, dim=-1)
+        logp_a = logp_all.gather(1, actions.view(-1, 1)).squeeze(1)
 
-        # map team -> reward (match obs dtype for consistency; will be cast later)
         r_red  = torch.full((agent_ids.numel(),), float(team_reward_red),  device=self.device, dtype=obs.dtype)
         r_blue = torch.full((agent_ids.numel(),), float(team_reward_blue), device=self.device, dtype=obs.dtype)
-        rew = torch.where(team_ids == 2.0, r_red, r_blue)  # (K,)
+        rew = torch.where(team_ids == 2.0, r_red, r_blue)
 
-        # store per-agent (force scalars -> shape (1,), keep dtypes as-is; we'll unify later)
         for i in range(agent_ids.numel()):
             aid = int(agent_ids[i].item())
             b = self._get_buf(aid)
@@ -101,10 +108,9 @@ class PerAgentPPORuntime:
             self._train_window_and_clear()
 
     def _stack(self, xs: List[torch.Tensor]) -> torch.Tensor:
-        # tensors are 1-D for val; use cat to avoid extra dims
         return torch.cat(xs, dim=0) if len(xs) > 1 else xs[0]
-    import torch
-    def _gae(self, rewards: torch.Tensor, values: torch.Tensor, dones: torch.Tensor) -> (torch.Tensor, torch.Tensor):
+
+    def _gae(self, rewards: torch.Tensor, values: torch.Tensor, dones: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         rewards, values, dones: shape (T,)
         returns: (advantages, returns)
@@ -112,35 +118,29 @@ class PerAgentPPORuntime:
         T = rewards.numel()
         adv = torch.zeros_like(rewards)
         last_gae = 0.0
-        next_value = 0.0  # bootstrap 0 at window boundary
-
-        if T <= 1:
-            mask = 1.0 - float(dones[0].item())
-            delta = rewards[0] + self.gamma * next_value * mask - values[0]
-            adv[0] = delta
-            ret = adv + values
-            return adv, ret
+        next_value = 0.0
 
         for t in reversed(range(T)):
             mask = 1.0 - float(dones[t].item())
-            delta = rewards[t] + self.gamma * next_value * mask - values[t]
+            if t == T - 1:
+                next_val_t = next_value # Bootstrap with 0 at the end of the window
+            else:
+                next_val_t = values[t + 1]
+            
+            delta = rewards[t] + self.gamma * next_val_t * mask - values[t]
             last_gae = delta + self.gamma * self.lam * mask * last_gae
             adv[t] = last_gae
-            next_value = values[t].item()
-
+        
         ret = adv + values
 
-        # normalize advantages per window if var>0
         if adv.numel() > 1:
             std = adv.std(unbiased=False)
-            if float(std.item()) > 0.0:
+            if float(std.item()) > 1e-8:
                 adv = (adv - adv.mean()) / (std + 1e-8)
-            else:
-                adv = adv - adv.mean()
         return adv, ret
 
-    def _policy_value(self, model: nn.Module, obs: torch.Tensor) -> (torch.Tensor, torch.Tensor, torch.Tensor):
-        logits, values = model(obs)                         # logits: (T,A), values: (T,) or (T,1)
+    def _policy_value(self, model: nn.Module, obs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        logits, values = model(obs)
         if values.dim() == 2 and values.size(-1) == 1:
             values = values.squeeze(-1)
         logp = F.log_softmax(logits, dim=-1)
@@ -148,61 +148,53 @@ class PerAgentPPORuntime:
         return logits, values, entropy
 
     def _ensure_trainable(self, model: nn.Module) -> None:
-        # Works for eager modules and ScriptModules (per-parameter toggle)
         for p in model.parameters():
             p.requires_grad_(True)
 
     def _train_window_and_clear(self) -> None:
-        # Train each agent independently on its own buffer
         for aid, b in list(self._buf.items()):
-            if len(b.obs) == 0:
+            if len(b.obs) < 1:
                 continue
             model = self.registry.brains[aid]
             if model is None:
-                self._buf[aid] = _Buf([], [], [], [], [], [])
+                self._buf.pop(aid, None)
                 continue
 
-            # unify dtype to model param dtype (usually fp32) to avoid fp16/fp32 mixing
             dtype = next(model.parameters()).dtype
-
             self._ensure_trainable(model)
             model.train()
             opt = self._get_opt(aid, model)
 
-            obs   = torch.stack(b.obs, dim=0).to(self.device, dtype=dtype)      # (T,D)
-            act   = torch.stack(b.act, dim=0).to(self.device).long()            # (T,)
-            logp_old = torch.stack(b.logp, dim=0).to(self.device, dtype=dtype)  # (T,)
-            val_old  = self._stack(b.val).to(self.device, dtype=dtype).view(-1) # (T,)
-            rew      = torch.stack(b.rew, dim=0).to(self.device, dtype=dtype)   # (T,)
-            done     = torch.stack(b.done, dim=0).to(self.device).bool()        # (T,)
+            obs      = torch.stack(b.obs, dim=0).to(self.device, dtype=dtype)
+            act      = torch.stack(b.act, dim=0).to(self.device).long()
+            logp_old = torch.stack(b.logp, dim=0).to(self.device, dtype=dtype)
+            val_old  = self._stack(b.val).to(self.device, dtype=dtype).view(-1)
+            rew      = torch.stack(b.rew, dim=0).to(self.device, dtype=dtype)
+            done     = torch.stack(b.done, dim=0).to(self.device).bool()
 
-            adv, ret = self._gae(rew, val_old, done)                            # (T,), (T,)
+            adv, ret = self._gae(rew, val_old, done)
 
             with torch.enable_grad():
                 for _ in range(self.epochs):
-                    logits, values, entropy = self._policy_value(model, obs)    # logits/values in 'dtype'
-                    logp = F.log_softmax(logits, dim=-1).gather(1, act.view(-1,1)).squeeze(1)  # (T,)
+                    logits, values, entropy = self._policy_value(model, obs)
+                    logp = F.log_softmax(logits, dim=-1).gather(1, act.view(-1,1)).squeeze(1)
                     ratio = torch.exp(logp - logp_old)
 
-                    # policy loss (clipped surrogate)
                     surr1 = ratio * adv
                     surr2 = torch.clamp(ratio, 1.0 - self.clip, 1.0 + self.clip) * adv
                     loss_pi = -torch.min(surr1, surr2).mean()
 
-                    # value loss (match dtypes)
                     loss_v = F.mse_loss(values.view(-1), ret)
-
-                    # entropy (encourage exploration)
                     loss_ent = -entropy.mean()
-
                     loss = loss_pi + self.vf_coef * loss_v + self.ent_coef * loss_ent
 
                     opt.zero_grad(set_to_none=True)
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                     opt.step()
+            
+            # --- NEW: Step the scheduler for this agent after its update window ---
+            if aid in self._sched:
+                self._sched[aid].step()
 
-            # clear buffer
             self._buf[aid] = _Buf([], [], [], [], [], [])
-
-        # keep step counter rolling (no reset)

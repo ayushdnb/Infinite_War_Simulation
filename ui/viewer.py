@@ -175,7 +175,6 @@ class WorldRenderer:
         if self.viewer.threat_vision_mode: self._draw_threat_vision(surf, wrect, c, state_data)
         if self.viewer.show_grid and c >= 6: self._draw_grid_lines(surf, wrect, c)
         self._draw_markers(surf, wrect, c, state_data["id_np"])
-        # self.viewer.anim_manager.draw(surf, wrect, self.cam) # Removed as requested
         if self.viewer.show_rays: self._draw_rays(surf, wrect, c, state_data)
 
     def _draw_hp_bars(self, surf, wrect, c, state_data):
@@ -289,7 +288,7 @@ class WorldRenderer:
             # Draw the final line
             end_pos_world = self.cam.world_to_screen(end_x, end_y)
             end_pos_screen = (wrect.x + end_pos_world[0] + c // 2,
-                            wrect.y + end_pos_world[1] + c // 2)
+                              wrect.y + end_pos_world[1] + c // 2)
             pygame.draw.line(surf, color, start_pos_screen, end_pos_screen, 1)
 
 class HudPanel:
@@ -539,12 +538,25 @@ class Viewer:
         self.cam = Camera(int(cell_size or config.CELL_SIZE), grid.shape[2], grid.shape[1])
         H, W = grid.shape[1], grid.shape[2]
         side_min_w, hud_h = 280, 126
-        max_w, max_h = 1920, 1080
+        
+        # --- MODIFICATION START ---
+        # Get actual screen size to prevent window from being too large
+        try:
+            display_info = pygame.display.Info()
+            max_w = display_info.current_w - 80  # Subtract padding for taskbar/decorations
+            max_h = display_info.current_h - 120
+        except pygame.error:
+            # Fallback if display is not ready (e.g., headless environment)
+            max_w, max_h = 1280, 720
+        # --- MODIFICATION END ---
+        
         world_px_w, world_px_h = W * self.cam.cell_px, H * self.cam.cell_px
         init_w = min(max_w, max(1280, world_px_w + side_min_w + 3 * self.margin))
         init_h = min(max_h, max(720, world_px_h + hud_h + 2 * self.margin))
+        
         self.Wpix, self.Hpix = int(init_w), int(init_h)
         self.screen = pygame.display.set_mode((self.Wpix, self.Hpix), pygame.RESIZABLE)
+        
         self.text_cache = TextCache()
         self.clock = pygame.time.Clock()
         self.selected_id: Optional[int] = None
