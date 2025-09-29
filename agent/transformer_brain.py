@@ -90,7 +90,6 @@ class TransformerBrain(nn.Module):
     """
     A transformer-based brain that processes observations by treating raycasts
     as a sequence of tokens and enriching them with the agent's state via attention.
-
     Architecture:
     1.  Embeds 64 rays (8 features each) and rich features (21) into 32-dim tokens.
     2.  Adds learnable positional encodings to the ray tokens.
@@ -137,6 +136,17 @@ class TransformerBrain(nn.Module):
 
         self.init_weights()
 
+    def _norm_then_linear(self, x: torch.Tensor, norm: nn.LayerNorm, linear: nn.Linear) -> torch.Tensor:
+        """
+        Run LayerNorm in fp32 (stable), then cast to linear's dtype before the matmul.
+        Works correctly under AMP.
+        """
+        # Always run LN in fp32 for numeric stability
+        with torch.cuda.amp.autocast(enabled=False):
+            x32 = norm(x.float())
+        # Cast to the Linear weight dtype (Half when AMP kicks in)
+        return linear(x32.to(dtype=linear.weight.dtype, device=x32.device))
+
     def init_weights(self):
         """Apply Xavier initialization to linear layers."""
         for m in self.modules():
@@ -159,9 +169,9 @@ class TransformerBrain(nn.Module):
         rays_raw = obs[:, :self.num_rays * self.ray_feat_dim].view(B, self.num_rays, self.ray_feat_dim)
         rich_raw = obs[:, self.num_rays * self.ray_feat_dim:]
 
-        # Normalize and project
-        ray_tokens = self.ray_embed_proj(self.ray_embed_norm(rays_raw))
-        rich_token = self.rich_embed_proj(self.rich_embed_norm(rich_raw)).unsqueeze(1) # (B, 1, D)
+        # Normalize and project using the AMP-safe helper
+        ray_tokens = self._norm_then_linear(rays_raw, self.ray_embed_norm, self.ray_embed_proj)
+        rich_token = self._norm_then_linear(rich_raw, self.rich_embed_norm, self.rich_embed_proj).unsqueeze(1)
 
         # 2. Add positional encoding
         ray_tokens = ray_tokens + self.positional_encoding

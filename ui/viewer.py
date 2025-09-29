@@ -2,7 +2,7 @@ from __future__ import annotations
 import os
 import collections
 from typing import List, Tuple, Optional, Dict
-
+import math
 import pygame
 import torch
 import torch.nn as nn
@@ -246,36 +246,51 @@ class WorldRenderer:
     def _draw_rays(self, surf, wrect, c, state_data):
         aid = self.viewer.selected_id
         if aid is None or aid not in state_data["agent_map"]: return
-        
-        x, y, _, my_team = state_data["agent_map"][aid]
-        pos_xy = torch.tensor([[x,y]], device=self.grid.device, dtype=torch.long)
-        
-        with torch.no_grad():
-            unit_map = build_unit_map(self.registry.agent_data, self.grid)
-            vision = self.registry.agent_data[aid, COL_VISION].unsqueeze(0)
-            rays_raw = raycast64_firsthit(pos_xy, self.grid, unit_map, max_steps_each=vision)
-        
-        rays = rays_raw.view(64, 8).cpu().numpy()
-        start_pos = (wrect.x + self.cam.world_to_screen(x,y)[0] + c//2, wrect.y + self.cam.world_to_screen(x,y)[1] + c//2)
-        
-        dirs = DIRS64.cpu()
-        max_steps = self.registry.agent_data[aid, COL_VISION].item()
-        
-        # MODIFIED: Step by 2 to draw 32 rays instead of 64 for better clarity
-        for i in range(0, dirs.shape[0], 2):
-            hit_type_idx, dist_norm = np.argmax(rays[i, :6]), rays[i, 6]
-            hit_team = 2.0 if hit_type_idx in {2,3} else 3.0 if hit_type_idx in {4,5} else 0
-            
-            color = RAY_COLORS["wall"]
-            if hit_type_idx == 0: color = RAY_COLORS["empty"]
-            elif hit_team != 0:
-                color = RAY_COLORS["enemy"] if my_team != hit_team else RAY_COLORS["ally"]
-            
-            dist = dist_norm * max_steps if dist_norm > 0 else max_steps
-            end_x, end_y = x + dirs[i,0].item() * dist, y + dirs[i,1].item() * dist
+
+        agent_x, agent_y, _, my_team = state_data["agent_map"][aid]
+        start_pos_screen = (wrect.x + self.cam.world_to_screen(agent_x, agent_y)[0] + c // 2,
+                            wrect.y + self.cam.world_to_screen(agent_x, agent_y)[1] + c // 2)
+
+        vision_range = int(self.registry.agent_data[aid, COL_VISION].item())
+        occ_grid = state_data["occ_np"]
+        H, W = occ_grid.shape
+
+        num_rays_to_draw = 32
+        for i in range(num_rays_to_draw):
+            angle = i * (2 * math.pi / num_rays_to_draw)
+            dx, dy = math.cos(angle), math.sin(angle)
+
+            end_x, end_y = agent_x, agent_y
+            color = RAY_COLORS["empty"]
+
+            # --- Manual Ray Step ---
+            for step in range(1, vision_range + 1):
+                test_x = int(round(agent_x + dx * step))
+                test_y = int(round(agent_y + dy * step))
+
+                # Check bounds
+                if not (0 <= test_x < W and 0 <= test_y < H):
+                    end_x, end_y = test_x, test_y
+                    break
+
+                occupant = occ_grid[test_y, test_x]
+                if occupant != 0: # Hit something
+                    end_x, end_y = test_x, test_y
+                    if occupant == 1: # Wall
+                        color = RAY_COLORS["wall"]
+                    else: # Agent
+                        hit_team = occupant
+                        color = RAY_COLORS["enemy"] if my_team != hit_team else RAY_COLORS["ally"]
+                    break
+            else: # No hit within range
+                end_x = agent_x + dx * vision_range
+                end_y = agent_y + dy * vision_range
+
+            # Draw the final line
             end_pos_world = self.cam.world_to_screen(end_x, end_y)
-            end_pos = (wrect.x + end_pos_world[0] + c//2, wrect.y + end_pos_world[1] + c//2)
-            pygame.draw.line(surf, color, start_pos, end_pos, 1)
+            end_pos_screen = (wrect.x + end_pos_world[0] + c // 2,
+                            wrect.y + end_pos_world[1] + c // 2)
+            pygame.draw.line(surf, color, start_pos_screen, end_pos_screen, 1)
 
 class HudPanel:
     def __init__(self, viewer, stats):

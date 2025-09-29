@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import os
 import json
+import time
 import signal
-import sys
+import traceback
+from pathlib import Path
 from typing import Optional
 
 import torch
@@ -13,16 +15,17 @@ try:
 except Exception:
     cv2 = None
 
-# Local modules - changed to absolute imports
+# Local modules
 import config
 from simulation.stats import SimulationStats
 from engine.agent_registry import AgentsRegistry
 from engine.tick import TickEngine
-from engine.grid import make_grid, assert_on_same_device
+from engine.grid import make_grid
 from engine.spawn import spawn_symmetric, spawn_uniform_random
 from engine.mapgen import add_random_walls, make_zones
 from utils.persistence import ResultsWriter
 from ui.viewer import Viewer
+
 
 # ------------------------------- helpers -------------------------------
 
@@ -66,6 +69,7 @@ def _config_snapshot() -> dict:
         "ARCHER_LOS_BLOCKS_WALLS": bool(getattr(config, "ARCHER_LOS_BLOCKS_WALLS", False)),
     }
 
+
 def _seed_all_from_env() -> Optional[int]:
     raw = os.getenv("FWS_SEED", "").strip()
     if not raw:
@@ -80,47 +84,69 @@ def _seed_all_from_env() -> Optional[int]:
     except (ValueError, TypeError):
         return None
 
+
+def _mkdir_p(p: Path) -> None:
+    p.mkdir(parents=True, exist_ok=True)
+
+
+def _atomic_json_dump(obj: dict, path: Path) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
 # --------------------------- simple video recorder ---------------------------
 
 class _SimpleRecorder:
-    def __init__(self, run_dir: str, grid: torch.Tensor, fps: int, scale: int):
+    def __init__(self, run_dir: Path, grid: torch.Tensor, fps: int, scale: int):
         self.enabled = False
+        self.writer = None
+        self.path = None
+        self.size = None
+        self.grid = grid
         if not getattr(config, "RECORD_VIDEO", False) or cv2 is None:
             return
 
-        H, W = int(grid.size(1)), int(grid.size(2))
-        self.size = (W * scale, H * scale)
-        self.path = os.path.join(run_dir, "simulation_raw.avi")
+        h, w = int(grid.size(1)), int(grid.size(2))
+        self.size = (w * scale, h * scale)
+        self.path = run_dir / "simulation_raw.avi"
         fourcc = cv2.VideoWriter_fourcc(*"MJPG")
-        self.writer = cv2.VideoWriter(self.path, fourcc, float(fps), self.size)
+        self.writer = cv2.VideoWriter(str(self.path), fourcc, float(fps), self.size)
 
-        if self.writer.isOpened():
+        if self.writer is not None and self.writer.isOpened():
             self.enabled = True
             print(f"[video] recording → {self.path}")
+            # index 0 channel assumed occupancy; palette can be expanded later
             self.palette = np.array([
-                [30, 30, 30], [80, 80, 80], [220, 80, 80], [80, 120, 240]
+                [30, 30, 30],   # 0
+                [80, 80, 80],   # 1
+                [220, 80, 80],  # 2
+                [80, 120, 240], # 3
             ], dtype=np.uint8)
-            self.grid = grid
         else:
             print(f"[video] ERROR: could not open writer for {self.path}.")
 
-    def write(self):
-        if not self.enabled: return
-        occ = self.grid[0].cpu().numpy().astype(np.uint8)
-        frame = self.palette[occ]
+    def write(self) -> None:
+        if not self.enabled:
+            return
+        occ = self.grid[0].detach().contiguous().to("cpu").numpy().astype(np.uint8)
+        frame = self.palette[occ % len(self.palette)]
         frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
         frame_resized = cv2.resize(frame_bgr, self.size, interpolation=cv2.INTER_NEAREST)
         self.writer.write(frame_resized)
 
-    def close(self):
-        if self.enabled and self.writer:
+    def close(self) -> None:
+        if self.enabled and self.writer is not None:
             self.writer.release()
             print(f"[video] saved → {self.path}")
 
+
 # ------------------------------ run loops ------------------------------
 
-def _headless_loop(engine, stats, reg, grid, rw, limit: int) -> None:
-    # Import here to avoid circular dependency issues at top-level
+def _headless_loop(engine: TickEngine, stats: SimulationStats, reg: AgentsRegistry,
+                   grid: torch.Tensor, rw: ResultsWriter, limit: int) -> None:
+    # Imported lazily to avoid any circular import pitfalls
     from utils.profiler import torch_profiler_ctx, nvidia_smi_summary
     from utils.sanitize import runtime_sanity_check
 
@@ -132,13 +158,13 @@ def _headless_loop(engine, stats, reg, grid, rw, limit: int) -> None:
                 deaths = stats.drain_dead_log()
                 if deaths:
                     rw.write_deaths(deaths)
-                
+
                 if (stats.tick % 500) == 0:
                     runtime_sanity_check(grid, reg.agent_data)
-                
+
                 if prof is not None:
                     prof.step()
-                
+
                 if (stats.tick % 100) == 0:
                     gpu = nvidia_smi_summary() or "-"
                     print(
@@ -149,6 +175,7 @@ def _headless_loop(engine, stats, reg, grid, rw, limit: int) -> None:
         except KeyboardInterrupt:
             print("\n[main] Interrupted — shutting down gracefully.")
 
+
 # --------------------------------- main --------------------------------
 
 def main() -> None:
@@ -157,65 +184,130 @@ def main() -> None:
     if seed is not None:
         print(f"[main] Using deterministic seed: {seed}")
 
+    # This prints your banner like: [final_war_sim] dev=... grid=... etc.
     print(config.summary_str())
 
+    # Build world
     grid = make_grid(config.TORCH_DEVICE)
     registry = AgentsRegistry(grid)
     stats = SimulationStats()
-
     add_random_walls(grid)
     zones = make_zones(config.GRID_HEIGHT, config.GRID_WIDTH, device=config.TORCH_DEVICE)
-    
+
+    # Spawning
     spawn_mode = os.getenv("FWS_SPAWN_MODE", "uniform").lower()
     if spawn_mode == "symmetric":
         spawn_symmetric(registry, grid, per_team=config.START_AGENTS_PER_TEAM)
     else:
         spawn_uniform_random(registry, grid, per_team=config.START_AGENTS_PER_TEAM)
 
+    # Engine
     engine = TickEngine(registry, grid, stats, zones=zones)
 
+    # Results
     rw = ResultsWriter()
-    run_dir = rw.start(config_obj=_config_snapshot())
+    run_dir = Path(rw.start(config_obj=_config_snapshot()))  # ensure created by ResultsWriter
+    _mkdir_p(run_dir)  # defensive: guarantee directory exists
     print(f"[main] Results → {run_dir}")
 
+    # Recorder
     recorder = _SimpleRecorder(
-        run_dir, grid, 
-        fps=getattr(config, "VIDEO_FPS", 30), 
-        scale=getattr(config, "VIDEO_SCALE", 4)
+        run_dir, grid,
+        fps=getattr(config, "VIDEO_FPS", 30),
+        scale=getattr(config, "VIDEO_SCALE", 4),
     )
-    
+
+    # Wrap tick to optionally record frames
     _orig_run_tick = engine.run_tick
+
     def _run_tick_with_recording():
         _orig_run_tick()
         if recorder.enabled and (stats.tick % getattr(config, "VIDEO_EVERY_TICKS", 1) == 0):
             recorder.write()
+
     engine.run_tick = _run_tick_with_recording
+
+    # Graceful signal handling: mark a flag we can read if needed
+    shutdown_requested = {"flag": False}
+
+    def _signal_handler(signum, frame):
+        shutdown_requested["flag"] = True
+        print(f"\n[main] Signal {signum} received — will finish current tick and shut down.")
+
+    # Register common signals (SIGTERM present on Windows too)
+    for sig in (signal.SIGINT, getattr(signal, "SIGTERM", signal.SIGINT)):
+        try:
+            signal.signal(sig, _signal_handler)
+        except Exception:
+            pass
+
+    # Main run
+    start_ts = time.strftime("%Y-%m-%d_%H-%M-%S")
+    start_time = time.time()
+    status = "ok"
+    error_msg = None
+    crash_trace = None
 
     try:
         if config.ENABLE_UI:
             viewer = Viewer(grid, cell_size=config.CELL_SIZE)
-            viewer.run(engine, registry, stats, tick_limit=config.TICK_LIMIT, target_fps=config.TARGET_FPS)
+            viewer.run(engine, registry, stats,
+                       tick_limit=config.TICK_LIMIT,
+                       target_fps=config.TARGET_FPS)
         else:
             _headless_loop(engine, stats, registry, grid, rw, limit=config.TICK_LIMIT)
     except KeyboardInterrupt:
         print("\n[main] Interrupted — flushing logs…")
+        status = "interrupted"
+    except Exception as e:
+        status = "crash"
+        error_msg = str(e)
+        crash_trace = "".join(traceback.format_exc())
+        _mkdir_p(run_dir)
+        (run_dir / "crash_trace.txt").write_text(crash_trace, encoding="utf-8")
+        raise
     finally:
-        # Graceful shutdown for persistence
-        if rw:
+        # Persist final artifacts even on crash/interrupt
+        try:
             deaths = stats.drain_dead_log()
-            if deaths: rw.write_deaths(deaths)
+            if deaths:
+                rw.write_deaths(deaths)
+        except Exception:
+            pass
+
+        # Final summary (atomic)
+        try:
             summary = {
-                "final_tick": stats.tick,
-                "elapsed_seconds": stats.elapsed_seconds,
-                "scores": {"red": stats.red.score, "blue": stats.blue.score},
+                "status": status,
+                "started_at": start_ts,
+                "duration_sec": round(time.time() - start_time, 3),
+                "final_tick": int(stats.tick),
+                "elapsed_seconds": float(stats.elapsed_seconds),
+                "scores": {"red": float(stats.red.score), "blue": float(stats.blue.score)},
+                "error": error_msg,
             }
-            with open(os.path.join(run_dir, "summary.json"), "w") as f:
-                json.dump(summary, f, indent=2)
+            _mkdir_p(run_dir)
+            _atomic_json_dump(summary, run_dir / "summary.json")
+        except Exception as e:
+            try:
+                (run_dir / "summary_fallback.txt").write_text(
+                    f"FAILED TO WRITE JSON SUMMARY: {e}\n{summary!r}", encoding="utf-8"
+                )
+            except Exception:
+                pass
+
+        # Close writer & recorder
+        try:
             rw.close()
-        if recorder:
+        except Exception:
+            pass
+        try:
             recorder.close()
+        except Exception:
+            pass
+
         print("[main] Shutdown complete.")
+
 
 if __name__ == "__main__":
     main()
-
