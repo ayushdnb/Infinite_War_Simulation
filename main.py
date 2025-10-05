@@ -198,10 +198,13 @@ def main() -> None:
     spawn_mode = os.getenv("FWS_SPAWN_MODE", "uniform").lower()
     if spawn_mode == "symmetric":
         spawn_symmetric(registry, grid, per_team=config.START_AGENTS_PER_TEAM)
+        print('[SYMETRIC_SPAWNING]')
     else:
         spawn_uniform_random(registry, grid, per_team=config.START_AGENTS_PER_TEAM)
+        print('[UNIFORM_RANDOM_SPAWNING]')
 
     # Engine
+    print('[INITIATING_TICK_ENGINE]')
     engine = TickEngine(registry, grid, stats, zones=zones)
 
     # Results

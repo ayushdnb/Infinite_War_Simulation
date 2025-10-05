@@ -66,7 +66,8 @@ def _cap(n: int) -> int:
 
 def _new_brain(device: torch.device):
     """Creates a new TransformerBrain, scripted or eager based on config."""
-    obs_dim = (64 * 8) + 21  # Hardcoded for the new architecture
+    # --- MODIFIED: Use obs_dim from config ---
+    obs_dim = config.OBS_DIM
     act_dim = int(getattr(config, "NUM_ACTIONS", 41))
     if bool(getattr(config, "PPO_ENABLED", False)):
         return TransformerBrain(obs_dim, act_dim).to(device)
@@ -78,7 +79,8 @@ def _clone_brain(parent, device: torch.device):
     if parent is None:
         return _new_brain(device)
     
-    obs_dim = (64 * 8) + 21
+    # --- MODIFIED: Use obs_dim from config ---
+    obs_dim = config.OBS_DIM
     act_dim = int(getattr(config, "NUM_ACTIONS", 41))
     
     is_script = isinstance(parent, torch.jit.ScriptModule)

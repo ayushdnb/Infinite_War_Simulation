@@ -55,7 +55,8 @@ class TickEngine:
         self._ensure_zone_tensors()
         self.DIRS8_dev = DIRS8.to(self.device)
         self._ACTIONS = int(getattr(config, "NUM_ACTIONS", 41))
-        self._OBS_DIM = (64 * 8) + 21
+        # --- MODIFIED: Use obs_dim from config ---
+        self._OBS_DIM = config.OBS_DIM
         self._grid_dt = self.grid.dtype
         self._data_dt = self.registry.agent_data.dtype
         self._g0 = torch.tensor(0.0, device=self.device, dtype=self._grid_dt)
@@ -98,15 +99,30 @@ class TickEngine:
         return red_deaths, blue_deaths
 
     @torch.no_grad()
-    def _build_transformer_obs(self, alive_idx: torch.Tensor) -> torch.Tensor:
+    def _build_transformer_obs(self, alive_idx: torch.Tensor, pos_xy: torch.Tensor) -> torch.Tensor:
         from engine.ray_engine.raycast_firsthit import build_unit_map
         data = self.registry.agent_data
         N = alive_idx.numel()
+
+        # --- NEW: Calculate zone flags for rich features ---
+        if self._z_heal is not None:
+            on_heal = self._z_heal[pos_xy[:, 1], pos_xy[:, 0]]
+        else:
+            on_heal = torch.zeros(N, device=self.device, dtype=torch.bool)
+        
+        on_cp = torch.zeros(N, device=self.device, dtype=torch.bool)
+        if self._z_cp_masks:
+            for cp_mask in self._z_cp_masks:
+                on_cp |= cp_mask[pos_xy[:, 1], pos_xy[:, 0]]
+        
         def _norm_const(v: float, scale: float) -> torch.Tensor:
             s = scale if scale > 0 else 1.0
             return torch.full((N,), v / s, dtype=self._data_dt, device=self.device)
-        rays = raycast64_firsthit(self.registry.positions_xy(alive_idx), self.grid, build_unit_map(data, self.grid), max_steps_each=data[alive_idx, COL_VISION].long())
+        
+        rays = raycast64_firsthit(pos_xy, self.grid, build_unit_map(data, self.grid), max_steps_each=data[alive_idx, COL_VISION].long())
         hp_max = data[alive_idx, COL_HP_MAX].clamp_min(1.0)
+        
+        # --- MODIFIED: Added on_heal and on_cp to the rich feature stack ---
         rich = torch.stack([
             data[alive_idx, COL_HP] / hp_max,
             data[alive_idx, COL_X] / (self.W - 1),
@@ -117,6 +133,8 @@ class TickEngine:
             (data[alive_idx, COL_UNIT] == 2.0),
             data[alive_idx, COL_ATK] / (config.MAX_ATK or 1.0),
             data[alive_idx, COL_VISION] / (config.RAYCAST_MAX_STEPS or 15.0),
+            on_heal.to(self._data_dt),
+            on_cp.to(self._data_dt),
             _norm_const(float(self.stats.tick), 50000.0),
             _norm_const(self.stats.red.score, 1000.0), _norm_const(self.stats.blue.score, 1000.0),
             _norm_const(self.stats.red.cp_points, 500.0), _norm_const(self.stats.blue.cp_points, 500.0),
@@ -140,7 +158,8 @@ class TickEngine:
             return vars(metrics)
 
         pos_xy = self.registry.positions_xy(alive_idx)
-        obs = self._build_transformer_obs(alive_idx)
+        # --- MODIFIED: Pass pos_xy to the observation builder ---
+        obs = self._build_transformer_obs(alive_idx, pos_xy)
         mask = build_mask(pos_xy, data[alive_idx, COL_TEAM], self.grid, unit=self._as_long(data[alive_idx, COL_UNIT]))
         actions = torch.zeros_like(alive_idx, dtype=torch.long)
         rec_agent_ids, rec_obs, rec_logits, rec_values, rec_actions, rec_teams = [], [], [], [], [], []
@@ -151,7 +170,8 @@ class TickEngine:
             logits32 = torch.where(mask[loc], dist.logits, torch.finfo(torch.float32).min).to(torch.float32)
             a = torch.distributions.Categorical(logits=logits32).sample()
             if self._ppo:
-                rec_agent_ids.append(bucket.indices); rec_obs.append(obs[loc]); rec_logits.append(logits32);
+                rec_agent_ids.append(bucket.indices)
+                rec_obs.append(obs[loc]); rec_logits.append(logits32);
                 rec_values.append(vals); rec_actions.append(a); rec_teams.append(data[bucket.indices, COL_TEAM])
             actions[loc] = a
         metrics.alive = int(alive_idx.numel())
@@ -220,7 +240,14 @@ class TickEngine:
                         red_on, blue_on = (on_cp & (teams_alive == 2.0)).sum(), (on_cp & (teams_alive == 3.0)).sum()
                         if red_on > blue_on: self.stats.add_capture_points("red", config.CP_REWARD_PER_TICK); metrics.cp_red_tick += config.CP_REWARD_PER_TICK
                         elif blue_on > red_on: self.stats.add_capture_points("blue", config.CP_REWARD_PER_TICK); metrics.cp_blue_tick += config.CP_REWARD_PER_TICK
-        
+                        
+                        # --- NEW: Individual reward for all agents on a contested CP ---
+                        # This encourages brawling and holding strategic ground.
+                        if red_on > 0 and blue_on > 0:
+                            agents_on_this_cp_idx = alive_idx[on_cp]
+                            reward_val = config.PPO_REWARD_CONTESTED_CP
+                            individual_rewards.index_add_(0, agents_on_this_cp_idx, torch.full_like(agents_on_this_cp_idx, reward_val, dtype=self._data_dt))
+
         if self._ppo and rec_agent_ids:
             agent_ids = torch.cat(rec_agent_ids)
             team_r_rew = (combat_bd * config.TEAM_KILL_REWARD) + (combat_rd * config.PPO_REWARD_DEATH) + metrics.cp_red_tick

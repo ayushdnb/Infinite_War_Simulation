@@ -19,7 +19,8 @@ def _rect_dims(n: int, max_cols: int, max_rows: int) -> Tuple[int, int, int]:
 
 def _mk_brain(device: torch.device):
     """Creates a new TransformerBrain instance."""
-    obs_dim = (64 * 8) + 21
+    # --- MODIFIED: Use obs_dim from config ---
+    obs_dim = config.OBS_DIM
     act_dim = int(getattr(config, "NUM_ACTIONS", 41))
     if bool(getattr(config, "PPO_ENABLED", False)):
         return TransformerBrain(obs_dim, act_dim).to(device)

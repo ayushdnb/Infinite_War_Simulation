@@ -71,7 +71,8 @@ UNIT_SOLDIER = UNIT_SOLDIER_ID
 UNIT_ARCHER  = UNIT_ARCHER_ID
 RAY_MAX_STEPS = RAYCAST_MAX_STEPS
 
-OBS_DIM = (64 * 8) + 21 # 512 for rays, 21 for rich features
+# --- MODIFIED: Increased rich feature count for new zone flags ---
+OBS_DIM = (64 * 8) + 23 # 512 for rays, 23 for rich features
 
 # ================================================================
 # Actions
@@ -144,9 +145,11 @@ MUTATION_FRACTION_ALIVE = _env_float("FWS_MUTATE_FRAC", 0.10)
 # PPO
 # ================================================================
 PPO_WINDOW_TICKS  = _env_int("FWS_PPO_TICKS", 128)
-PPO_REWARD_HP_TICK         = _env_float("FWS_PPO_REW_HP_TICK", 0.01)
+PPO_REWARD_HP_TICK         = _env_float("FWS_PPO_REW_HP_TICK", 0.2)
 PPO_REWARD_KILL_INDIVIDUAL = _env_float("FWS_PPO_REW_KILL_AGENT", 5)
 PPO_REWARD_DEATH = _env_float("FWS_PPO_REW_DEATH", -0.3)
+# --- NEW: Individual reward for contesting a capture point ---
+PPO_REWARD_CONTESTED_CP    = _env_float("FWS_PPO_REW_CONTEST", 0.1)
 PPO_LR            = _env_float("FWS_PPO_LR", 3e-4)
 # --- NEW SCHEDULER PARAMS ---
 PPO_LR_T_MAX      = _env_int("FWS_PPO_T_MAX", 500_000) # Decay over 500k training steps
