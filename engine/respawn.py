@@ -10,7 +10,7 @@ import torch.jit
 import config
 from .agent_registry import (
     AgentsRegistry,
-    COL_ALIVE, COL_TEAM, COL_X, COL_Y, COL_HP, COL_ATK, COL_UNIT,
+    COL_ALIVE, COL_TEAM,
     TEAM_RED_ID, TEAM_BLUE_ID
 )
 # Import the new brain
@@ -23,8 +23,8 @@ _respawn_counter = 0
 # Config knobs (safe fallbacks)
 # ----------------------------
 RESP_FLOOR_PER_TEAM = int(getattr(config, "RESP_FLOOR_PER_TEAM", 50))
-RESP_MAX_PER_TICK = int(getattr(config, "RESP_MAX_PER_TICK", 15))
-RESP_PERIOD_TICKS = int(getattr(config, "RESP_PERIOD_TICKS", 200))
+RESP_MAX_PER_TICK = int(getattr(config, "RESP_MAX_PER_TICK", 5))
+RESP_PERIOD_TICKS = int(getattr(config, "RESP_PERIOD_TICKS", 500))
 RESP_PERIOD_BUDGET = int(getattr(config, "RESP_PERIOD_BUDGET", 20))
 RESP_HYST_COOLDOWN_TICKS = int(getattr(config, "RESP_HYST_COOLDOWN_TICKS", 30))
 RESPAWN_MODE = str(getattr(config, "RESPAWN_MODE", "uniform")).lower()
@@ -130,11 +130,11 @@ def _unit_stats(unit_id: int) -> Tuple[float, float, int]:
     return SOLDIER_HP, SOLDIER_ATK, VISION_SOLDIER
 
 def _write_agent_to_registry(
-    reg: AgentsRegistry, slot: int, team_id: float, x: int, y: int,
+    reg: AgentsRegistry, slot: int, agent_id: int, team_id: float, x: int, y: int,
     unit_id: int, hp: float, atk: float, vision: int, brain: torch.nn.Module
 ) -> None:
     reg.register(
-        slot, team_is_red=(team_id == TEAM_RED_ID), x=x, y=y,
+        slot, agent_id=agent_id, team_is_red=(team_id == TEAM_RED_ID), x=x, y=y,
         hp=hp, atk=atk, brain=brain, unit=unit_id,
         hp_max=hp, vision_range=vision, generation=0
     )
@@ -162,6 +162,9 @@ def _respawn_some(reg: AgentsRegistry, grid: torch.Tensor, team_id: float, count
         if x < 0:
             break
 
+        # --- NEW: Get a unique ID for the new agent ---
+        agent_id = reg.get_next_id()
+
         unit_id = _choose_unit()
         hp0, atk0, vision0 = _unit_stats(unit_id)
 
@@ -172,7 +175,7 @@ def _respawn_some(reg: AgentsRegistry, grid: torch.Tensor, team_id: float, count
             hp0 *= (1.0 + random.uniform(0.5, 2.0))
             atk0 *= (1.0 + random.uniform(0.5, 2.0))
             vision0 = int(vision0 * (1.0 + random.uniform(0.5, 2.0)))
-            print(f"** Rare Mutation on agent {slot}! HP:{hp0:.2f}, ATK:{atk0:.2f}, VIS:{vision0} **")
+            print(f"** Rare Mutation on new agent {agent_id} (slot {slot})! HP:{hp0:.2f}, ATK:{atk0:.2f}, VIS:{vision0} **")
 
         use_clone = (parents.numel() > 0) and (random.random() < RESP_CLONE_PROB)
         if use_clone:
@@ -182,7 +185,7 @@ def _respawn_some(reg: AgentsRegistry, grid: torch.Tensor, team_id: float, count
         else:
             brain = _new_brain(device)
 
-        _write_agent_to_registry(reg, slot, team_id, x, y, unit_id, hp0, atk0, vision0, brain)
+        _write_agent_to_registry(reg, slot, agent_id, team_id, x, y, unit_id, hp0, atk0, vision0, brain)
 
         # Also update the grid
         grid[0, y, x] = team_id
@@ -225,4 +228,3 @@ class RespawnController:
                 spawned_b += _respawn_some(reg, grid, TEAM_BLUE_ID, _cap(q_b))
 
         return spawned_r, spawned_b
-

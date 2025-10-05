@@ -1,4 +1,3 @@
-# final_war_sim/utils/persistence.py
 from __future__ import annotations
 from dataclasses import dataclass
 from multiprocessing import Process, Queue

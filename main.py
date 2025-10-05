@@ -308,6 +308,5 @@ def main() -> None:
 
         print("[main] Shutdown complete.")
 
-
 if __name__ == "__main__":
     main()

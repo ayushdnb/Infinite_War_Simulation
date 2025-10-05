@@ -1,68 +1,54 @@
-# final_war_sim/recorder/video_writer.py
 from __future__ import annotations
 
-import os
+import datetime as _dt
+from dataclasses import dataclass
 from typing import Optional
 
-import numpy as np
+try:
+    import pyarrow as pa  # type: ignore
+except Exception:
+    pa = None  # graceful fallback
 
 
-class VideoWriter:
+# --------- Arrow schema (if available) ----------
+def tick_arrow_schema():
     """
-    Lazy MP4 writer. If ffmpeg is unavailable, falls back to PNG frames.
-    Expected frame: HxWx3 uint8 (RGB).
+    Parquet/Arrow schema for per-tick agent rows.
+    Columns are intentionally simple (analytics-friendly).
     """
-    def __init__(self, run_dir: str, fps: int = 60):
-        self.run_dir = os.path.abspath(run_dir)
-        self.fps = int(max(1, fps))
-        self._mp4_path = os.path.join(self.run_dir, "simulation.mp4")
-        self._frames_dir = os.path.join(self.run_dir, "frames_fallback")
-        self._writer = None
-        self._mode = None  # "mp4" or "pngs"
+    if pa is None:
+        return None
+    return pa.schema([
+        pa.field("tick", pa.int64()),
+        pa.field("agent_id", pa.int32()),
+        pa.field("team_id", pa.int16()),     # 2 or 3
+        pa.field("is_alive", pa.bool_()),
+        pa.field("pos_x", pa.int16()),
+        pa.field("pos_y", pa.int16()),
+        pa.field("hp", pa.float32()),
+        pa.field("atk", pa.float32()),
+        pa.field("action", pa.int16()),
+        pa.field("logits", pa.list_(pa.float32())),  # variable length
+    ])
 
-    def _ensure_writer(self, frame: np.ndarray):
-        if self._writer is not None:
-            return
-        # Try MP4 first
-        try:
-            import imageio  # type: ignore
-            # H.264 sometimes not bundled; let imageio pick available codec
-            self._writer = imageio.get_writer(self._mp4_path, fps=self.fps)
-            self._mode = "mp4"
-            return
-        except Exception:
-            # Fallback: PNG frames
-            os.makedirs(self._frames_dir, exist_ok=True)
-            self._writer = True  # sentinel
-            self._mode = "pngs"
 
-    def add_frame(self, frame: np.ndarray):
-        if frame is None:
-            return
-        if frame.ndim != 3 or frame.shape[2] != 3:
-            raise ValueError(f"VideoWriter expects HxWx3 RGB uint8; got {frame.shape}")
-        if frame.dtype != np.uint8:
-            frame = frame.astype(np.uint8, copy=False)
-        self._ensure_writer(frame)
+# --------- Lightweight dataclass (for clarity/tests) ----------
+@dataclass(frozen=True)
+class RunMeta:
+    started_utc: str
+    grid_h: int
+    grid_w: int
+    obs_dim: int
+    num_actions: int
+    commit: Optional[str] = None
+    note: Optional[str] = None
 
-        if self._mode == "mp4":
-            import imageio  # type: ignore
-            self._writer.append_data(frame)
-        else:
-            # frames_fallback/frame_00000001.png
-            idx = len(os.listdir(self._frames_dir)) + 1
-            path = os.path.join(self._frames_dir, f"frame_{idx:08d}.png")
-            try:
-                import imageio  # type: ignore
-                imageio.imwrite(path, frame)
-            except Exception:
-                # Last-ditch: numpy save (rare)
-                np.save(path.replace(".png", ".npy"), frame)
-
-    def close(self):
-        if self._mode == "mp4" and self._writer is not None:
-            try:
-                self._writer.close()
-            except Exception:
-                pass
-        self._writer = None
+    @staticmethod
+    def new(grid_h: int, grid_w: int, obs_dim: int, num_actions: int,
+            commit: Optional[str] = None, note: Optional[str] = None) -> "RunMeta":
+        return RunMeta(
+            started_utc=_dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+            grid_h=int(grid_h), grid_w=int(grid_w),
+            obs_dim=int(obs_dim), num_actions=int(num_actions),
+            commit=commit, note=note,
+        )

@@ -52,9 +52,13 @@ def _place_if_free(
     
     hp, atk, vision = _unit_stats(unit_val)
     
+    # --- NEW: Get a unique ID before registering ---
+    agent_id = reg.get_next_id()
+
     # Register agent with its new attributes
     reg.register(
         slot,
+        agent_id=agent_id, # Pass the new ID
         team_is_red=team_is_red,
         x=x, y=y,
         hp=hp,
@@ -160,4 +164,3 @@ def spawn_uniform_random(reg: AgentsRegistry, grid: torch.Tensor, per_team: int)
     
     if slot < total_to_spawn:
         print(f"[spawn] Warning: Could only spawn {slot}/{total_to_spawn} agents. The map might be too full.")
-

@@ -14,13 +14,15 @@ COL_X     = 2       # float: x coordinate
 COL_Y     = 3       # float: y coordinate
 COL_HP    = 4       # float: current health points
 COL_UNIT  = 5       # float: 1.0 = Soldier, 2.0 = Archer
-# --- New Per-Agent Attribute Columns ---
+# --- Per-Agent Attribute Columns ---
 COL_HP_MAX = 6      # float: maximum health points for this agent
 COL_VISION = 7      # float: vision range in cells for this agent
 COL_ATK    = 8      # float: attack power for this agent
+# --- NEW: UNIQUE AGENT ID ---
+COL_AGENT_ID = 9    # float: permanent unique ID for this agent
 
 # Update the total number of features
-NUM_COLS = 9 
+NUM_COLS = 10
 
 # Ensure config matches this new layout if it's used elsewhere
 if hasattr(config, 'AGENT_FEATURES'):
@@ -41,9 +43,6 @@ class Bucket:
     indices: torch.Tensor          # LongTensor [K] of agent indices
     models: List[nn.Module]        # length K (same order as indices)
 
-# ================================================================
-# Agents Registry
-# ================================================================
 class AgentsRegistry:
     """
     Stores all agents in the simulation as a big tensor (SoA layout).
@@ -54,6 +53,9 @@ class AgentsRegistry:
         self.grid = grid
         self.device = grid.device
         self.capacity = int(config.MAX_AGENTS)
+
+        # --- NEW: Unique ID counter ---
+        self._next_agent_id: int = 0
 
         # Main agent tensor (SoA layout)
         self.agent_data = torch.zeros(
@@ -69,7 +71,7 @@ class AgentsRegistry:
 
         # Add column constants as instance attributes for easy access
         self.COL_ALIVE, self.COL_TEAM, self.COL_X, self.COL_Y, self.COL_HP, self.COL_UNIT = 0, 1, 2, 3, 4, 5
-        self.COL_HP_MAX, self.COL_VISION, self.COL_ATK = 6, 7, 8
+        self.COL_HP_MAX, self.COL_VISION, self.COL_ATK, self.COL_AGENT_ID = 6, 7, 8, 9
 
 
     def clear(self) -> None:
@@ -78,11 +80,21 @@ class AgentsRegistry:
         self.agent_data[:, COL_ALIVE] = 0.0
         self.brains = [None] * self.capacity
         self.generations = [0] * self.capacity
+        # --- NEW: Reset ID counter on clear ---
+        self._next_agent_id = 0
+
+    # --- NEW: Method to get the next available unique ID ---
+    def get_next_id(self) -> int:
+        """Returns the next available unique agent ID and increments the counter."""
+        agent_id = self._next_agent_id
+        self._next_agent_id += 1
+        return agent_id
 
     def register(
         self,
         slot: int,
         *,
+        agent_id: int, # --- NEW: Required parameter
         team_is_red: bool,
         x: int,
         y: int,
@@ -108,6 +120,9 @@ class AgentsRegistry:
         d[slot, COL_UNIT]  = float(unit)
         d[slot, COL_HP_MAX] = float(hp_max)
         d[slot, COL_VISION]= float(vision_range)
+        # --- NEW: Store the permanent unique ID ---
+        d[slot, COL_AGENT_ID] = float(agent_id)
+
         self.brains[slot]  = brain.to(self.device)
         self.generations[slot] = int(generation)
 
@@ -151,6 +166,5 @@ class AgentsRegistry:
             idx = torch.tensor(lst, dtype=torch.long, device=self.device)
             models = [self.brains[j] for j in lst if j < len(self.brains) and self.brains[j] is not None]
             if models:
-              out.append(Bucket(signature=key, indices=idx, models=models))
+                out.append(Bucket(signature=key, indices=idx, models=models))
         return out
-

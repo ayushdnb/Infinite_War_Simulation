@@ -1,4 +1,3 @@
-# final_war_sim/utils/sanitize.py
 from __future__ import annotations
 import torch
 import config

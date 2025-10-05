@@ -1,4 +1,3 @@
-# final_war_sim/engine/ego_tick_adapter.py
 from __future__ import annotations
 from typing import Optional, Sequence, Tuple
 import torch
@@ -22,7 +21,7 @@ class EgoFrameRuntime:
 
     Usage inside your tick loop (pseudocode):
         ego = EgoFrameRuntime(capacity=registry.capacity, device=self.device)
-
+    
         # at the start of the tick:
         alive_idx = ... (LongTensor [K])
         pos_xy    = registry.positions_xy(alive_idx)        # Long [K,2]

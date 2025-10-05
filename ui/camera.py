@@ -1,4 +1,3 @@
-# final_war_sim/ui/camera.py
 from __future__ import annotations
 
 class Camera:

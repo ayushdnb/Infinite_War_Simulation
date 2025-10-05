@@ -1,4 +1,3 @@
-# codex_bellum/engine/game/move_mask.py
 from __future__ import annotations
 import torch
 import config

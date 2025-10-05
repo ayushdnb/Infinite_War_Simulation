@@ -124,4 +124,4 @@ class RayEncoder(nn.Module):
             x = self.pe(x)                       # (B,8,proj_dim+pe)
         x = self.attn(x)                         # (B,8,D)
         x = x.reshape(B, -1)                     # (B,8*D)
-        return self.out(x)                       # (B,out_dim)
+        return self.out(x)        

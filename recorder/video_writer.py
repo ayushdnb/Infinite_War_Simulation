@@ -1,4 +1,3 @@
-# final_war_sim/recorder/video_writer.py
 from __future__ import annotations
 
 import os

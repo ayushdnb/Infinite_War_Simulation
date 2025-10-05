@@ -1,4 +1,3 @@
-# final_war_sim/engine/ego_frame.py
 from __future__ import annotations
 from typing import Tuple, Optional, List
 import torch

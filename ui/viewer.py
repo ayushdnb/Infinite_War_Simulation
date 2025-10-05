@@ -10,7 +10,7 @@ import numpy as np
 
 import config
 from .camera import Camera
-from engine.agent_registry import COL_ALIVE, COL_TEAM, COL_HP, COL_X, COL_Y, COL_UNIT, COL_HP_MAX, COL_VISION, COL_ATK
+from engine.agent_registry import COL_ALIVE, COL_TEAM, COL_HP, COL_X, COL_Y, COL_UNIT, COL_HP_MAX, COL_VISION, COL_ATK, COL_AGENT_ID
 from engine.ray_engine.raycast_64 import raycast64_firsthit, DIRS64
 from engine.ray_engine.raycast_firsthit import build_unit_map
 
@@ -163,7 +163,7 @@ class WorldRenderer:
 
         for i in state_data["alive_indices"]:
             if i not in state_data["agent_map"]: continue
-            x, y, unit, team = state_data["agent_map"][i]
+            x, y, unit, team, _ = state_data["agent_map"][i]
             color_key = f"{'red' if team == 2.0 else 'blue'}_{'archer' if unit == 2.0 else 'soldier'}"
             color = COLORS[color_key]
             cx, cy = self.cam.world_to_screen(x,y)
@@ -181,7 +181,7 @@ class WorldRenderer:
         if c < 8: return
         hp_bar_surf = pygame.Surface(wrect.size, pygame.SRCALPHA)
         for aid in state_data["alive_indices"]:
-            x, y, _, _ = state_data["agent_map"][aid]
+            x, y, _, _, _ = state_data["agent_map"][aid]
             hp_max = self.registry.agent_data[aid, COL_HP_MAX].item()
             if hp_max > 0:
                 hp_ratio = self.registry.agent_data[aid, COL_HP].item() / hp_max
@@ -198,10 +198,11 @@ class WorldRenderer:
         surf.blit(hp_bar_surf, wrect.topleft)
         
     def _draw_threat_vision(self, surf, wrect, c, state_data):
-        aid = self.viewer.selected_id
+        # FIX 1: Changed selected_id to selected_slot_id
+        aid = self.viewer.selected_slot_id
         if aid is None or aid not in state_data["agent_map"]: return
         
-        my_x, my_y, _, my_team = state_data["agent_map"][aid]
+        my_x, my_y, _, my_team, _ = state_data["agent_map"][aid]
         my_cx, my_cy = self.cam.world_to_screen(my_x, my_y)
 
         vision_range = self.registry.agent_data[aid, COL_VISION].item()
@@ -211,7 +212,7 @@ class WorldRenderer:
         center_px = (my_cx + c//2, my_cy + c//2)
         pygame.draw.circle(overlay, OVERLAYS["vision_range"], center_px, vision_px)
 
-        for other_aid, (ox, oy, _, o_team) in state_data["agent_map"].items():
+        for other_aid, (ox, oy, _, o_team, _) in state_data["agent_map"].items():
             if aid == other_aid: continue
             dist = np.hypot(ox - my_x, oy - my_y)
             if dist <= vision_range:
@@ -243,10 +244,11 @@ class WorldRenderer:
                 pygame.draw.rect(surf, COLORS["marker"], (wrect.x+cx, wrect.y+cy, c,c), max(1, c//8))
     
     def _draw_rays(self, surf, wrect, c, state_data):
-        aid = self.viewer.selected_id
+        # FIX 2: Changed selected_id to selected_slot_id
+        aid = self.viewer.selected_slot_id
         if aid is None or aid not in state_data["agent_map"]: return
 
-        agent_x, agent_y, _, my_team = state_data["agent_map"][aid]
+        agent_x, agent_y, _, my_team, _ = state_data["agent_map"][aid]
         start_pos_screen = (wrect.x + self.cam.world_to_screen(agent_x, agent_y)[0] + c // 2,
                             wrect.y + self.cam.world_to_screen(agent_x, agent_y)[1] + c // 2)
 
@@ -312,11 +314,11 @@ class HudPanel:
         self.viewer.minimap.draw(surf, hud, state_data)
 
     def _draw_team_stats(self, surf, y, x, state_data):
-        r_alive = sum(1 for _, _, _, team in state_data["agent_map"].values() if team == 2.0)
+        r_alive = sum(1 for _, _, _, team, _ in state_data["agent_map"].values() if team == 2.0)
         b_alive = len(state_data["agent_map"]) - r_alive
-        rs_alive = sum(1 for _, _, unit, team in state_data["agent_map"].values() if team == 2.0 and unit == 1.0)
+        rs_alive = sum(1 for _, _, unit, team, _ in state_data["agent_map"].values() if team == 2.0 and unit == 1.0)
         ra_alive = r_alive - rs_alive
-        bs_alive = sum(1 for _, _, unit, team in state_data["agent_map"].values() if team == 3.0 and unit == 1.0)
+        bs_alive = sum(1 for _, _, unit, team, _ in state_data["agent_map"].values() if team == 3.0 and unit == 1.0)
         ba_alive = b_alive - bs_alive
 
         red_str = f"Red  S:{self.stats.red.score:6.1f} CP:{self.stats.red.cp_points:4.1f} K:{self.stats.red.kills:3d} D:{self.stats.red.deaths:3d} Alive:{r_alive:3d} (S:{rs_alive} A:{ra_alive})"
@@ -397,20 +399,30 @@ class SidePanel:
         x = srect.x + pad
         
         surf.blit(self.viewer.text_cache.render("Agent Inspector", 18, COLORS["text"]), (x, y)); y += 30
-        aid = self.viewer.selected_id
         
-        if aid is None:
+        # MODIFIED: Changed from `self.viewer.selected_id` to `self.viewer.selected_slot_id`
+        # This keeps the logic clean, as the UI inspector primarily deals with the agent's current state.
+        slot_id = self.viewer.selected_slot_id
+        
+        if slot_id is None:
             surf.blit(self.viewer.text_cache.render("Click an agent to inspect.", 13, COLORS["text_dim"]), (x, y)); y += 30
-        elif aid not in state_data["agent_map"]:
-            surf.blit(self.viewer.text_cache.render(f"ID: {aid} (Dead)", 13, COLORS["warn"]), (x, y)); y += 30
+        elif slot_id not in state_data["agent_map"]:
+            # Display last known unique ID if the agent is dead
+            uid_str = f"ID: {self.viewer.last_selected_uid} (Dead)" if self.viewer.last_selected_uid is not None else f"Slot: {slot_id} (Dead)"
+            surf.blit(self.viewer.text_cache.render(uid_str, 13, COLORS["warn"]), (x, y)); y += 30
         else:
-            surf.blit(self.viewer.text_cache.render(f"ID: {aid}", 16, COLORS["green"]), (x, y)); y += 24
+            _, _, _, _, unique_id = state_data["agent_map"][slot_id]
+            surf.blit(self.viewer.text_cache.render(f"ID: {int(unique_id)}", 16, COLORS["green"]), (x, y)); y += 24
             
-            agent_data = self.registry.agent_data[aid]
+            agent_data = self.registry.agent_data[slot_id]
             pos = (int(agent_data[COL_X].item()), int(agent_data[COL_Y].item()))
             hp, hp_max = agent_data[COL_HP].item(), agent_data[COL_HP_MAX].item()
             atk, vision = agent_data[COL_ATK].item(), agent_data[COL_VISION].item()
             hp_ratio = hp / hp_max if hp_max > 0 else 0
+            
+            # --- NEW: Display the agent's individual score ---
+            agent_score = self.viewer.agent_scores.get(int(unique_id), 0.0)
+            surf.blit(self.viewer.text_cache.render(f"Score: {agent_score:.2f}", 13, COLORS["text_dim"]), (x, y)); y += 18
             
             surf.blit(self.viewer.text_cache.render(f"Pos: ({pos[0]}, {pos[1]})", 13, COLORS["text_dim"]), (x, y)); y += 18
             bar_w = srect.width - 2 * pad
@@ -421,7 +433,7 @@ class SidePanel:
             surf.blit(self.viewer.text_cache.render(f"Attack: {atk:.2f}", 13, COLORS["text_dim"]), (x, y)); y += 18
             surf.blit(self.viewer.text_cache.render(f"Vision: {vision} cells", 13, COLORS["text_dim"]), (x, y)); y += 22
 
-            brain = self.registry.brains[aid]
+            brain = self.registry.brains[slot_id]
             if brain:
                 surf.blit(self.viewer.text_cache.render(f"Model: {_get_model_summary(brain)}", 13, COLORS["text_dim"]), (x, y)); y += 18
                 surf.blit(self.viewer.text_cache.render(f"Params: {_param_count(brain):,}", 13, COLORS["text_dim"]), (x, y)); y += 18
@@ -445,7 +457,7 @@ class Minimap:
         surf.fill(COLORS["empty"], map_rect)
         
         # Draw agents
-        for x, y, unit, team in state_data["agent_map"].values():
+        for x, y, unit, team, _ in state_data["agent_map"].values():
             dot_x = map_rect.x + int(x / self.grid_w * map_w)
             dot_y = map_rect.y + int(y / self.grid_h * map_h)
             color = COLORS["red"] if team == 2.0 else COLORS["blue"]
@@ -491,9 +503,9 @@ class InputHandler:
                 if ev.key == pygame.K_ESCAPE: running = False
                 elif ev.key == pygame.K_SPACE: self.viewer.paused = not self.viewer.paused
                 elif ev.key == pygame.K_PERIOD and self.viewer.paused: advance_tick = True
-                elif ev.key == pygame.K_m and self.viewer.selected_id is not None:
-                    if self.viewer.selected_id in self.viewer.marked: self.viewer.marked.remove(self.viewer.selected_id)
-                    elif len(self.viewer.marked) < 10: self.viewer.marked.append(self.viewer.selected_id)
+                elif ev.key == pygame.K_m and self.viewer.selected_slot_id is not None:
+                    if self.viewer.selected_slot_id in self.viewer.marked: self.viewer.marked.remove(self.viewer.selected_slot_id)
+                    elif len(self.viewer.marked) < 10: self.viewer.marked.append(self.viewer.selected_slot_id)
                 elif ev.key == pygame.K_r: self.viewer.show_rays = not self.viewer.show_rays
                 elif ev.key == pygame.K_t: self.viewer.threat_vision_mode = not self.viewer.threat_vision_mode
                 elif ev.key == pygame.K_b: self.viewer.battle_view_enabled = not self.viewer.battle_view_enabled
@@ -512,8 +524,11 @@ class InputHandler:
             elif ev.type == pygame.MOUSEBUTTONDOWN:
                 if ev.button == 1 and wrect.collidepoint(ev.pos):
                     gx, gy = self.viewer.cam.screen_to_world(ev.pos[0] - wrect.x, ev.pos[1] - wrect.y)
-                    aid = int(self.viewer.grid[2, gy, gx].item())
-                    self.viewer.selected_id = aid if aid >= 0 else None
+                    slot_id = int(self.viewer.grid[2, gy, gx].item())
+                    # MODIFIED: Store both slot_id and last known unique_id
+                    self.viewer.selected_slot_id = slot_id if slot_id >= 0 else None
+                    if slot_id >= 0:
+                        self.viewer.last_selected_uid = int(self.viewer.registry.agent_data[slot_id, COL_AGENT_ID].item())
                 elif ev.button == 4: self.viewer.cam.zoom_at(1.12); self.viewer.world_renderer.static_surf = None
                 elif ev.button == 5: self.viewer.cam.zoom_at(1/1.12); self.viewer.world_renderer.static_surf = None
         return running, advance_tick
@@ -559,7 +574,9 @@ class Viewer:
         
         self.text_cache = TextCache()
         self.clock = pygame.time.Clock()
-        self.selected_id: Optional[int] = None
+        # MODIFIED: Track slot_id for interaction and last_selected_uid for display when dead
+        self.selected_slot_id: Optional[int] = None
+        self.last_selected_uid: Optional[int] = None
         self.marked: List[int] = []
         self.show_rays = False
         self.paused = False
@@ -567,16 +584,20 @@ class Viewer:
         self.battle_view_enabled = False
         self.fullscreen = False
         self.speed_multiplier = 1.0
+        # --- NEW: Dictionary to track individual agent scores ---
+        self.agent_scores: Dict[int, float] = collections.defaultdict(float)
 
     def save_selected_brain(self):
-        if self.selected_id is None or not hasattr(self, 'registry'): return
-        brain = self.registry.brains[self.selected_id]
+        if self.selected_slot_id is None or not hasattr(self, 'registry'): return
+        brain = self.registry.brains[self.selected_slot_id]
         if brain:
             tick = self.stats.tick if hasattr(self, 'stats') else 0
-            filename = f"brain_agent_{self.selected_id}_t_{tick}.pth"
+            # MODIFIED: Use last selected UID for a persistent filename
+            uid = self.last_selected_uid if self.last_selected_uid is not None else self.selected_slot_id
+            filename = f"brain_agent_{uid}_t_{tick}.pth"
             try:
                 torch.save(brain.state_dict(), filename)
-                print(f"[Viewer] Saved brain for agent {self.selected_id} to '{filename}'")
+                print(f"[Viewer] Saved brain for agent {uid} to '{filename}'")
             except Exception as e:
                 print(f"[Viewer] Error saving brain: {e}")
 
@@ -591,6 +612,28 @@ class Viewer:
         self.minimap = Minimap(self)
         self.world_renderer.build_static_cache(engine)
         
+        # --- NEW: Hook into the PPO runtime to track rewards ---
+        if hasattr(engine, '_ppo') and engine._ppo is not None:
+            original_record_step = engine._ppo.record_step
+            
+            def record_step_with_score_tracking(*args, **kwargs):
+                # Update scores before the original function is called
+                agent_ids = kwargs.get('agent_ids')
+                rewards = kwargs.get('rewards')
+                if agent_ids is not None and rewards is not None:
+                    # This tracks all rewards (team + individual). We can refine later if needed.
+                    for i in range(agent_ids.numel()):
+                        # We need the slot ID to get the permanent unique ID
+                        slot_id = agent_ids[i].item()
+                        uid = int(registry.agent_data[slot_id, COL_AGENT_ID].item())
+                        reward_val = rewards[i].item()
+                        self.agent_scores[uid] += reward_val
+                
+                return original_record_step(*args, **kwargs)
+
+            engine._ppo.record_step = record_step_with_score_tracking
+        # --- END NEW ---
+
         running = True
         frame_count = 0
         while running:
@@ -606,30 +649,22 @@ class Viewer:
                 num_ticks_this_frame = 1
             
             for _ in range(num_ticks_this_frame):
-                # This logic is kept in case animations are re-enabled later
-                # pre_tick_hp = {i: registry.agent_data[i, COL_HP].item() for i in range(registry.capacity) if registry.agent_data[i, COL_ALIVE] > 0.5}
                 engine.run_tick()
-                # for i, old_hp in pre_tick_hp.items():
-                #     if i < registry.capacity and registry.agent_data[i, COL_ALIVE] > 0.5:
-                #         new_hp = registry.agent_data[i, COL_HP].item()
-                #         if new_hp < old_hp:
-                #             pos = (registry.agent_data[i, COL_X].item(), registry.agent_data[i, COL_Y].item())
-                #             self.anim_manager.add("damage", pos)
                 self.hud_panel.update()
-
-            # self.anim_manager.update() # Removed as requested
 
             with torch.no_grad():
                 grid_cpu = self.grid.detach().cpu()
                 alive_mask = registry.agent_data[:, COL_ALIVE] > 0.5
                 alive_indices_tensor = torch.nonzero(alive_mask).squeeze(1)
                 alive_indices = alive_indices_tensor.cpu().tolist()
-            
+                
                 agent_map = {i: (
                     registry.agent_data[i, COL_X].item(),
                     registry.agent_data[i, COL_Y].item(),
                     registry.agent_data[i, COL_UNIT].item(),
-                    registry.agent_data[i, COL_TEAM].item()
+                    registry.agent_data[i, COL_TEAM].item(),
+                    # --- NEW: Pass the unique ID to the state data ---
+                    registry.agent_data[i, COL_AGENT_ID].item()
                 ) for i in alive_indices}
 
                 state_data = {

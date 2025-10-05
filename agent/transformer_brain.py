@@ -1,6 +1,4 @@
-from __future__ import annotations
 from typing import Tuple
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -149,4 +147,4 @@ class TransformerBrain(nn.Module):
 def scripted_transformer_brain(obs_dim: int, act_dim: int) -> torch.jit.ScriptModule:
     """TorchScript brain for non-PPO runs."""
     model = TransformerBrain(obs_dim, act_dim)
-    return torch.jit.script(model)
+    return torch.jit.script(model)# 
