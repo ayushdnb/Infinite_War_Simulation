@@ -2,8 +2,8 @@ from pathlib import Path
 from datetime import datetime
 
 # --- Config ---
-BASE_DIR = Path(r"C:\Kishan\rl_projects\transformer_brain")
-OUT_FILE = BASE_DIR / "codes" / "transformer_brain.txt"
+BASE_DIR = Path(r"C:\Kishan\RL_Project\rich_feature")
+OUT_FILE = BASE_DIR / "codes" / "rich_feature.txt"
 
 # Set to True if you want to APPEND on every run (instead of recreating fresh)
 APPEND = False

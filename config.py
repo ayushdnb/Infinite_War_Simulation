@@ -45,10 +45,10 @@ TORCH_DTYPE: torch.dtype = torch.float16 if AMP_ENABLED and torch.cuda.is_availa
 # ================================================================
 # World / Runtime
 # ================================================================
-GRID_WIDTH  = _env_int("FWS_GRID_W", 64)
-GRID_HEIGHT = _env_int("FWS_GRID_H", 64)
-START_AGENTS_PER_TEAM = _env_int("FWS_START_PER_TEAM", 50)
-MAX_AGENTS = _env_int("FWS_MAX_AGENTS", 150)
+GRID_WIDTH  = _env_int("FWS_GRID_W", 100)
+GRID_HEIGHT = _env_int("FWS_GRID_H", 100)
+START_AGENTS_PER_TEAM = _env_int("FWS_START_PER_TEAM", 80)
+MAX_AGENTS = _env_int("FWS_MAX_AGENTS", 300)
 # --- MODIFIED: Increased feature count for the new ID column ---
 AGENT_FEATURES = _env_int("FWS_AGENT_FEATS", 10)
 
@@ -62,8 +62,8 @@ UNIT_SOLDIER_ID = 1
 UNIT_ARCHER_ID  = 2
 
 VISION_RANGE_BY_UNIT = {
-    UNIT_SOLDIER_ID: _env_int("FWS_VISION_SOLDIER", 8),
-    UNIT_ARCHER_ID:  _env_int("FWS_VISION_ARCHER", 12),
+    UNIT_SOLDIER_ID: _env_int("FWS_VISION_SOLDIER", 10),
+    UNIT_ARCHER_ID:  _env_int("FWS_VISION_ARCHER", 10),
 }
 
 RAYCAST_MAX_STEPS = max(max(VISION_RANGE_BY_UNIT.values()), 1)
@@ -84,15 +84,15 @@ NUM_ACTIONS = _env_int("FWS_NUM_ACTIONS", 41)
 # ================================================================
 MAX_HP       = _env_float("FWS_MAX_HP", 1.0)
 SOLDIER_HP   = _env_float("FWS_SOLDIER_HP", 1.00)
-ARCHER_HP    = _env_float("FWS_ARCHER_HP", 0.80)
+ARCHER_HP    = _env_float("FWS_ARCHER_HP", 0.70)
 
-BASE_ATK     = _env_float("FWS_BASE_ATK", 0.40)
+BASE_ATK     = _env_float("FWS_BASE_ATK", 0.35)
 SOLDIER_ATK  = _env_float("FWS_SOLDIER_ATK", BASE_ATK)
-ARCHER_ATK   = _env_float("FWS_ARCHER_ATK", 0.35)
+ARCHER_ATK   = _env_float("FWS_ARCHER_ATK", 0.20)
 MAX_ATK      = max(SOLDIER_ATK, ARCHER_ATK, BASE_ATK, 1e-6)
 
-ARCHER_RANGE = _env_int("FWS_ARCHER_RANGE", 6)
-ARCHER_LOS_BLOCKS_WALLS = _env_bool("FWS_ARCHER_BLOCK_LOS", False)
+ARCHER_RANGE = _env_int("FWS_ARCHER_RANGE", 4)
+ARCHER_LOS_BLOCKS_WALLS = _env_bool("FWS_ARCHER_BLOCK_LOS", True)
 
 # ================================================================
 # Metabolism
@@ -113,25 +113,25 @@ RESPAWN_JITTER_RADIUS    = _env_int("FWS_RESPAWN_JITTER", 5)
 # ================================================================
 # Map Generation
 # ================================================================
-RANDOM_WALLS      = _env_int("FWS_RAND_WALLS", 16)
-WALL_SEG_MIN      = _env_int("FWS_WALL_SEG_MIN", 7)
-WALL_SEG_MAX      = _env_int("FWS_WALL_SEG_MAX", 50)
+RANDOM_WALLS      = _env_int("FWS_RAND_WALLS", 14)
+WALL_SEG_MIN      = _env_int("FWS_WALL_SEG_MIN", 14)
+WALL_SEG_MAX      = _env_int("FWS_WALL_SEG_MAX", 87)
 WALL_AVOID_MARGIN = _env_int("FWS_WALL_AVOID_MARGIN", 1)
 
-HEAL_ZONE_COUNT      = _env_int("FWS_HEAL_COUNT", 7)
-HEAL_ZONE_SIZE_RATIO = _env_float("FWS_HEAL_SIZE_RATIO", 10/256)
-HEAL_RATE            = _env_float("FWS_HEAL_RATE", 0.01)
+HEAL_ZONE_COUNT      = _env_int("FWS_HEAL_COUNT", 4)
+HEAL_ZONE_SIZE_RATIO = _env_float("FWS_HEAL_SIZE_RATIO", 15/128)
+HEAL_RATE            = _env_float("FWS_HEAL_RATE", 0.001)
 
-CP_COUNT           = _env_int("FWS_CP_COUNT", 9)
-CP_SIZE_RATIO      = _env_float("FWS_CP_SIZE_RATIO", 15/256)
-CP_REWARD_PER_TICK = _env_float("FWS_CP_REWARD", 0.05)
+CP_COUNT           = _env_int("FWS_CP_COUNT", 6)
+CP_SIZE_RATIO      = _env_float("FWS_CP_SIZE_RATIO", 15/138)
+CP_REWARD_PER_TICK = _env_float("FWS_CP_REWARD", 0.35)
 
 # ================================================================
 # Team Rewards
 # ================================================================
 TEAM_KILL_REWARD       = _env_float("FWS_REW_KILL",       1.0)
 TEAM_DMG_DEALT_REWARD  = _env_float("FWS_REW_DMG_DEALT",  0.00)
-TEAM_DEATH_PENALTY     = _env_float("FWS_REW_DEATH",     -0.4)
+TEAM_DEATH_PENALTY     = _env_float("FWS_REW_DEATH",     -0.8)
 TEAM_DMG_TAKEN_PENALTY = _env_float("FWS_REW_DMG_TAKEN",  0.00)
 
 # ================================================================
@@ -144,12 +144,13 @@ MUTATION_FRACTION_ALIVE = _env_float("FWS_MUTATE_FRAC", 0.10)
 # ================================================================
 # PPO
 # ================================================================
-PPO_WINDOW_TICKS  = _env_int("FWS_PPO_TICKS", 128)
+PPO_ENABLED: bool = _env_bool("FWS_PPO_ENABLED", True)
+PPO_WINDOW_TICKS  = _env_int("FWS_PPO_TICKS", 256)
 PPO_REWARD_HP_TICK         = _env_float("FWS_PPO_REW_HP_TICK", 0.2)
-PPO_REWARD_KILL_INDIVIDUAL = _env_float("FWS_PPO_REW_KILL_AGENT", 5)
-PPO_REWARD_DEATH = _env_float("FWS_PPO_REW_DEATH", -0.3)
+PPO_REWARD_KILL_INDIVIDUAL = _env_float("FWS_PPO_REW_KILL_AGENT", 3.5)
+PPO_REWARD_DEATH = _env_float("FWS_PPO_REW_DEATH", -3.0)
 # --- NEW: Individual reward for contesting a capture point ---
-PPO_REWARD_CONTESTED_CP    = _env_float("FWS_PPO_REW_CONTEST", 0.1)
+PPO_REWARD_CONTESTED_CP    = _env_float("FWS_PPO_REW_CONTEST", 0.4)
 PPO_LR            = _env_float("FWS_PPO_LR", 3e-4)
 # --- NEW SCHEDULER PARAMS ---
 PPO_LR_T_MAX      = _env_int("FWS_PPO_T_MAX", 500_000) # Decay over 500k training steps
@@ -165,7 +166,7 @@ PPO_MAX_GRAD_NORM = _env_float("FWS_PPO_MAXGN", 1.0)
 # UI / Viewer
 # ================================================================
 ENABLE_UI  = _env_bool("FWS_UI", True)
-CELL_SIZE  = _env_int("FWS_CELL_SIZE", 8) # Increased for better visibility on smaller grids
+CELL_SIZE  = _env_int("FWS_CELL_SIZE", 6) # Increased for better visibility on smaller grids
 TARGET_FPS = _env_int("FWS_TARGET_FPS", 60)
 
 # ================================================================

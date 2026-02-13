@@ -77,3 +77,58 @@ desktop.ini
 # -------- Optional: local config overrides (uncomment if you create them) --------
 # config.local.py
 # .env.local
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+venv/
+.env/
+.venv/
+
+# Results & recordings
+results/
+recorder/
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# VS Code
+.vscode/
+
+# Model checkpoints (OPTIONAL)
+# Uncomment if you don't want to upload large model
+# *.pth
+
+# Dump files
+rich_feature.txt
+dump_*.txt
+
+# Cache
+.cache/
+# Python cache
+__pycache__/
+*.pyc
+
+# Simulation outputs
+results/
+recorder/
+
+# Dump files
+codes/
+*.txt
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# VS Code
+.vscode/
+
+# Optional: ignore large model (recommended)
+# Uncomment if repo becomes heavy
+# *.pth

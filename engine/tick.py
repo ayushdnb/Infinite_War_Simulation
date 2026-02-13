@@ -84,19 +84,33 @@ class TickEngine:
     def _as_long(x: torch.Tensor) -> torch.Tensor: return x.to(torch.long)
     def _recompute_alive_idx(self) -> torch.Tensor: return (self.registry.agent_data[:, COL_ALIVE] > 0.5).nonzero(as_tuple=False).squeeze(1)
 
-    def _apply_deaths(self, sel: torch.Tensor, metrics: TickMetrics) -> Tuple[int, int]:
+    def _apply_deaths(self, sel: torch.Tensor, metrics: TickMetrics, credit_kills: bool = True) -> Tuple[int, int]:
         data = self.registry.agent_data
         dead_idx = sel.nonzero(as_tuple=False).squeeze(1) if sel.dtype == torch.bool else sel.view(-1)
-        if dead_idx.numel() == 0: return 0, 0
+        if dead_idx.numel() == 0:
+            return 0, 0
+
         dead_team = data[dead_idx, COL_TEAM]
-        red_deaths, blue_deaths = int((dead_team == 2.0).sum().item()), int((dead_team == 3.0).sum().item())
-        if red_deaths: self.stats.add_death("red", red_deaths); self.stats.add_kill("blue", red_deaths)
-        if blue_deaths: self.stats.add_death("blue", blue_deaths); self.stats.add_kill("red", blue_deaths)
+        red_deaths = int((dead_team == 2.0).sum().item())
+        blue_deaths = int((dead_team == 3.0).sum().item())
+
+        # Always punish the team that lost agents (deaths + score penalty).
+        if red_deaths:
+            self.stats.add_death("red", red_deaths)
+            if credit_kills:
+                self.stats.add_kill("blue", red_deaths)
+
+        if blue_deaths:
+            self.stats.add_death("blue", blue_deaths)
+            if credit_kills:
+                self.stats.add_kill("red", blue_deaths)
+
         gx, gy = self._as_long(data[dead_idx, COL_X]), self._as_long(data[dead_idx, COL_Y])
         self.grid[0][gy, gx], self.grid[1][gy, gx], self.grid[2][gy, gx] = self._g0, self._g0, self._gneg
         data[dead_idx, COL_ALIVE] = self._d0
         metrics.deaths += int(dead_idx.numel())
         return red_deaths, blue_deaths
+
 
     @torch.no_grad()
     def _build_transformer_obs(self, alive_idx: torch.Tensor, pos_xy: torch.Tensor) -> torch.Tensor:
@@ -192,6 +206,8 @@ class TickEngine:
                 metrics.moved = int(can_move.sum().item())
 
         combat_rd, combat_bd = 0, 0
+        meta_rd, meta_bd = 0, 0
+
         individual_rewards = torch.zeros(self.registry.capacity, device=self.device, dtype=self._data_dt)
         if (is_attack := actions >= 9).any():
             atk_idx, atk_act = alive_idx[is_attack], actions[is_attack]
@@ -231,8 +247,14 @@ class TickEngine:
                 data[alive_idx, COL_HP] -= drain.to(self._data_dt)
                 self.grid[1, pos_xy[:, 1], pos_xy[:, 0]] = data[alive_idx, COL_HP].to(self._grid_dt)
                 if (data[alive_idx, COL_HP] <= 0.0).any():
-                    rD, bD = self._apply_deaths(alive_idx[data[alive_idx, COL_HP] <= 0.0], metrics)
-                    combat_rd += rD; combat_bd += bD
+                    rD, bD = self._apply_deaths(
+                        alive_idx[data[alive_idx, COL_HP] <= 0.0],
+                        metrics,
+                        credit_kills=False,   # metabolism deaths: punish only, no opponent kill credit
+                    )
+                    meta_rd += rD
+                    meta_bd += bD
+
             if self._z_cp_masks and (alive_idx := self._recompute_alive_idx()).numel() > 0:
                 pos_xy, teams_alive = self.registry.positions_xy(alive_idx), data[alive_idx, COL_TEAM]
                 for cp_mask in self._z_cp_masks:
@@ -243,15 +265,27 @@ class TickEngine:
                         
                         # --- NEW: Individual reward for all agents on a contested CP ---
                         # This encourages brawling and holding strategic ground.
-                        if red_on > 0 and blue_on > 0:
-                            agents_on_this_cp_idx = alive_idx[on_cp]
-                            reward_val = config.PPO_REWARD_CONTESTED_CP
-                            individual_rewards.index_add_(0, agents_on_this_cp_idx, torch.full_like(agents_on_this_cp_idx, reward_val, dtype=self._data_dt))
+                        if red_on > 0 and blue_on > 0:  # contested
+                            winners_on_cp = None
+                            if red_on > blue_on:
+                                winners_on_cp = on_cp & (teams_alive == 2.0)  # red winners
+                            elif blue_on > red_on:
+                                winners_on_cp = on_cp & (teams_alive == 3.0)  # blue winners
+
+                            if winners_on_cp is not None and winners_on_cp.any():
+                                winners_idx = alive_idx[winners_on_cp]
+                                reward_val = config.PPO_REWARD_CONTESTED_CP
+                                individual_rewards.index_add_(
+                                    0,
+                                    winners_idx,
+                                    torch.full_like(winners_idx, reward_val, dtype=self._data_dt),
+                                )
 
         if self._ppo and rec_agent_ids:
             agent_ids = torch.cat(rec_agent_ids)
-            team_r_rew = (combat_bd * config.TEAM_KILL_REWARD) + (combat_rd * config.PPO_REWARD_DEATH) + metrics.cp_red_tick
-            team_b_rew = (combat_rd * config.TEAM_KILL_REWARD) + (combat_bd * config.PPO_REWARD_DEATH) + metrics.cp_blue_tick
+            team_r_rew = (combat_bd * config.TEAM_KILL_REWARD) + ((combat_rd + meta_rd) * config.PPO_REWARD_DEATH) + metrics.cp_red_tick
+            team_b_rew = (combat_rd * config.TEAM_KILL_REWARD) + ((combat_bd + meta_bd) * config.PPO_REWARD_DEATH) + metrics.cp_blue_tick
+
             current_hp = data[agent_ids, COL_HP]
             hp_reward = (current_hp * config.PPO_REWARD_HP_TICK).to(self._data_dt)
             final_rewards = individual_rewards[agent_ids] + torch.where(torch.cat(rec_teams) == 2.0, team_r_rew, team_b_rew) + hp_reward
