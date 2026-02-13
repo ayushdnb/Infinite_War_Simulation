@@ -1,11 +1,7 @@
+# war_simulation/rl/__init__.py
 """
-Reinforcement learning components for final_war_sim.
+RL utilities.
 
-This package contains training code for learning agent policies. The
-current implementation includes a simple PPO trainer skeleton. It is
-not fully functional but demonstrates how to structure the RL logic.
+Note: the live simulation can run without RL components.
+Keep this package lightweight to avoid import-side effects.
 """
-
-from .ppo import PerAgentPPO
-
-__all__ = ["PPOTrainer"]

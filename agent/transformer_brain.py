@@ -2,11 +2,7 @@ from typing import Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
 import config
-
-# --- Transformer Building Blocks ---
-
 class CrossAttentionBlock(nn.Module):
     """
     A single block of Cross-Attention followed by a Feed-Forward network.

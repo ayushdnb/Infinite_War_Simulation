@@ -132,3 +132,42 @@ Thumbs.db
 # Optional: ignore large model (recommended)
 # Uncomment if repo becomes heavy
 # *.pth
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+
+# Virtualenv
+.venv/
+venv/
+env/
+.env
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build / dist
+build/
+dist/
+*.egg-info/
+
+# Project outputs
+results/
+*.avi
+*.mp4
+frames_fallback/
+
+# Model / checkpoints (if you ever save brains)
+*.pt
+*.pth
+*.ckpt
+
+# Optional profiler outputs
+*.json
+*.trace
