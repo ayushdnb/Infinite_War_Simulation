@@ -65,7 +65,7 @@ class TransformerBrain(nn.Module):
         self.act_dim = int(act_dim)
         self.embed_dim = int(embed_dim)
 
-        self.num_rays = 64
+        self.num_rays = 32
         self.ray_feat_dim = 8
         self.rich_feat_dim = self.obs_dim - (self.num_rays * self.ray_feat_dim)
         

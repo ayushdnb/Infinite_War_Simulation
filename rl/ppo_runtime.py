@@ -1,7 +1,7 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
-
+import math
 import torch
 import torch.nn.functional as F
 from torch import nn, optim
@@ -48,6 +48,81 @@ class PerAgentPPORuntime:
         self._sched: Dict[int, CosineAnnealingLR] = {}
         self._step = 0
 
+    def _assert_record_shapes(
+        self,
+        agent_ids: torch.Tensor,
+        obs: torch.Tensor,
+        logits: torch.Tensor,
+        values: torch.Tensor,
+        actions: torch.Tensor,
+    ) -> None:
+        # Device invariants (no silent CPU fallback)
+        dev = self.device
+        if agent_ids.device != dev or obs.device != dev or logits.device != dev or values.device != dev or actions.device != dev:
+            raise RuntimeError(
+                f"[ppo] device mismatch: ids={agent_ids.device} obs={obs.device} logits={logits.device} "
+                f"values={values.device} actions={actions.device} expected={dev}"
+            )
+        # Shape invariants
+        if agent_ids.dim() != 1:
+            raise RuntimeError(f"[ppo] agent_ids must be (B,), got {tuple(agent_ids.shape)}")
+        B = int(agent_ids.size(0))
+        if obs.dim() != 2 or int(obs.size(0)) != B or int(obs.size(1)) != int(self.obs_dim):
+            raise RuntimeError(f"[ppo] obs must be (B,{int(self.obs_dim)}), got {tuple(obs.shape)}")
+        if logits.dim() != 2 or int(logits.size(0)) != B or int(logits.size(1)) != int(self.act_dim):
+            raise RuntimeError(f"[ppo] logits must be (B,{int(self.act_dim)}), got {tuple(logits.shape)}")
+        # Accept value as (B,) or (B,1) but normalize later
+        if values.dim() == 2 and (int(values.size(0)) == B and int(values.size(1)) == 1):
+            pass
+        elif values.dim() == 1 and int(values.size(0)) == B:
+            pass
+        else:
+            raise RuntimeError(f"[ppo] values must be (B,) or (B,1), got {tuple(values.shape)}")
+        if actions.dim() != 1 or int(actions.size(0)) != B:
+            raise RuntimeError(f"[ppo] actions must be (B,), got {tuple(actions.shape)}")
+
+    def _assert_no_optimizer_sharing(self, aids: List[int]) -> None:
+        """
+        Defensive check: ensure we never accidentally share the same optimizer object across slots.
+        This should always be true under the NO HIVE MIND constraint.
+        """
+        seen = {}
+        for aid in aids:
+            opt = self._opt.get(int(aid), None)
+            if opt is None:
+                continue
+            key = id(opt)
+            if key in seen and seen[key] != int(aid):
+                raise RuntimeError(f"[ppo] optimizer object shared between slots {seen[key]} and {aid} (forbidden).")
+            seen[key] = int(aid)
+
+    def reset_agent(self, aid: int) -> None:
+        """Hard-reset PPO state for a slot (buffer + optimizer + scheduler).
+
+        Required when a *new* agent respawns into an existing slot so that
+        optimizer moments and rollout history are not inherited.
+        """
+        assert 0 <= int(aid) < int(self.registry.capacity), f"aid out of range: {aid}"
+        # Order matters: scheduler holds a ref to optimizer.
+        self._sched.pop(int(aid), None)
+        self._opt.pop(int(aid), None)
+        self._buf.pop(int(aid), None)
+
+    def reset_agents(self, aids: torch.Tensor | List[int]) -> None:
+        """Vectorized helper; accepts LongTensor or Python list of slot indices."""
+        if aids is None:
+            return
+        if isinstance(aids, torch.Tensor):
+            if aids.numel() == 0:
+                return
+            lst = aids.to("cpu").tolist()
+        else:
+            if len(aids) == 0:
+                return
+            lst = list(aids)
+        for a in lst:
+            self.reset_agent(int(a))
+
     def _get_buf(self, aid: int) -> _Buf:
         if aid not in self._buf:
             self._buf[aid] = _Buf([], [], [], [], [], [])
@@ -73,6 +148,9 @@ class PerAgentPPORuntime:
         """
         Append a single decision step for all agents in this tick.
         """
+        # Fail loud on any mismatch instead of silently corrupting PPO buffers.
+        self._assert_record_shapes(agent_ids, obs, logits, values, actions)
+
         logp_a = F.log_softmax(logits, dim=-1).gather(1, actions.view(-1, 1)).squeeze(1)
 
         for i in range(agent_ids.numel()):
@@ -115,6 +193,12 @@ class PerAgentPPORuntime:
         return logits, values, entropy
 
     def _train_window_and_clear(self) -> None:
+        if len(self._buf) == 0:
+            return
+
+        # Defensive check for "no hive mind" optimizer sharing.
+        self._assert_no_optimizer_sharing(list(self._buf.keys()))
+
         for aid, b in list(self._buf.items()):
             if not b.obs: continue
             model = self.registry.brains[aid]
@@ -154,4 +238,4 @@ class PerAgentPPORuntime:
             if aid in self._sched:
                 self._sched[aid].step()
 
-            b.obs.clear(); b.act.clear(); b.logp.clear(); b.val.clear(); b.rew.clear(); b.done.clear()# 
+            b.obs.clear(); b.act.clear(); b.logp.clear(); b.val.clear(); b.rew.clear(); b.done.clear()
