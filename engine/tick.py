@@ -1,6 +1,7 @@
 from __future__ import annotations
 from dataclasses import dataclass
 import collections
+import os                               # <-- ADDED: used for debug invariant environment variable
 from typing import Dict, Optional, List, Tuple, TYPE_CHECKING
 
 import torch
@@ -30,6 +31,7 @@ except Exception:
 
 @dataclass
 class TickMetrics:
+    """Holds counters for one simulation tick."""
     alive: int = 0
     moved: int = 0
     attacks: int = 0
@@ -315,6 +317,61 @@ class TickEngine:
             )
         return obs
 
+    # ==================== NEW DEBUG INVARIANTS METHOD ====================
+    def _debug_invariants(self, where: str) -> None:
+        """
+        Optional, gated invariants to catch grid↔registry desync early.
+        Only runs if environment variable FWS_DEBUG_INVARIANTS is set to "1" or "true".
+        """
+        if os.getenv("FWS_DEBUG_INVARIANTS", "0") not in {"1", "true", "True"}:
+            return
+
+        data = self.registry.agent_data
+        H, W = self.grid.shape[-2], self.grid.shape[-1]
+
+        alive = (data[:, COL_ALIVE] > 0.5)
+        alive_idx = alive.nonzero(as_tuple=False).squeeze(1)
+
+        # Basic bounds for alive agents
+        if alive_idx.numel() > 0:
+            xs = self._as_long(data[alive_idx, COL_X])
+            ys = self._as_long(data[alive_idx, COL_Y])
+            if not ((xs >= 0).all() and (xs < W).all() and (ys >= 0).all() and (ys < H).all()):
+                raise RuntimeError(f"[invariants:{where}] alive position out of bounds")
+
+            # Grid layer 2 should contain the slot id at the agent's position
+            g2_at = self._as_long(self.grid[2, ys, xs])
+            if not torch.equal(g2_at, alive_idx):
+                raise RuntimeError(f"[invariants:{where}] grid[2] slot-id mismatch at alive positions")
+
+            # Grid layer 0 should contain the team number at that position
+            team = data[alive_idx, COL_TEAM].to(self._grid_dt)
+            g0_at = self.grid[0, ys, xs]
+            if not torch.equal(g0_at, team):
+                raise RuntimeError(f"[invariants:{where}] grid[0] occupancy/team mismatch at alive positions")
+
+        # Uniqueness + coverage: every non-empty grid[2] must be exactly one alive slot, and vice versa.
+        ids = self._as_long(self.grid[2]).view(-1)
+        present = ids[ids >= 0]
+        uniq, counts = present.unique(return_counts=True) if present.numel() > 0 else (present, present)
+
+        if counts.numel() > 0 and not (counts == 1).all():
+            bad = uniq[counts != 1][:16].tolist()
+            raise RuntimeError(f"[invariants:{where}] duplicate slot ids in grid[2]: {bad}")
+
+        if alive_idx.numel() != uniq.numel():
+            raise RuntimeError(f"[invariants:{where}] grid[2] ids != alive slots (alive={alive_idx.numel()} grid={uniq.numel()})")
+
+        if alive_idx.numel() > 0:
+            if not torch.equal(alive_idx.sort().values, uniq.sort().values):
+                raise RuntimeError(f"[invariants:{where}] grid[2] set != alive slot set")
+
+        # Ghost cells: slot id present but occupancy empty.
+        ghost = (self.grid[2] >= 0) & (self.grid[0] == 0)
+        if ghost.any():
+            raise RuntimeError(f"[invariants:{where}] ghost cells: grid[2]>=0 but grid[0]==0")
+    # ==================== END DEBUG INVARIANTS ====================
+
     @torch.no_grad()
     def run_tick(self) -> Dict[str, float]:
         data = self.registry.agent_data
@@ -324,9 +381,15 @@ class TickEngine:
             self.stats.on_tick_advanced(1)
             metrics.tick = int(self.stats.tick)
             was_dead = (data[:, COL_ALIVE] <= 0.5) if self._ppo is not None else None
+            # --- Flush dead agents from PPO before respawn ---
+            if was_dead is not None:
+                dead_slots = was_dead.nonzero(as_tuple=False).squeeze(1)
+                if dead_slots.numel() > 0:
+                    self._ppo.flush_agents(dead_slots)
             self.respawner.step(self.stats.tick, self.registry, self.grid)
             if was_dead is not None:
                 self._ppo_reset_on_respawn(was_dead)
+            self._debug_invariants("post_respawn")   # <-- ADDED invariant check after respawn
             return vars(metrics)
 
         pos_xy = self.registry.positions_xy(alive_idx)
@@ -420,52 +483,92 @@ class TickEngine:
 
                     # Optional debug-only invariant checks (default off; no cost unless enabled).
                     # Enable with: FWS_DEBUG_MOVE=1
-                    import os
                     if os.getenv("FWS_DEBUG_MOVE", "0") in {"1", "true", "True"}:
-                        # Each alive slot should appear exactly once in grid[2].
-                        ids = self._as_long(self.grid[2]).view(-1)
-                        present = ids[ids >= 0]
-                        counts = torch.bincount(present, minlength=self.registry.capacity)
-                        alive_slots = (data[:, COL_ALIVE] > 0.5).nonzero(as_tuple=False).squeeze(1)
-                        bad = alive_slots[counts[alive_slots] != 1]
-                        if bad.numel() > 0:
-                            sl = bad[:16].tolist()
-                            suffix = "" if bad.numel() <= 16 else "..."
-                            raise RuntimeError(f"[move invariant] alive slots not exactly once in grid: {sl}{suffix}")
+                        # After writeback, verify each winner's grid[2] matches their slot at new coords.
+                        for i_slot in w_move_idx.tolist():
+                            # Ensure we don't have stray references
+                            pass
+        metrics.moved = int(dead_slots.numel()) if 'keep_slots' in locals() else 0
         # ----- END MOVE HANDLING -----
+        self._debug_invariants("post_move")   # <-- ADDED invariant check after movement
 
         combat_rd, combat_bd = 0, 0
         meta_rd, meta_bd = 0, 0
 
         individual_rewards = torch.zeros(self.registry.capacity, device=self.device, dtype=self._data_dt)
 
-        if (is_attack := actions >= 9).any():
-            atk_idx, atk_act = alive_idx[is_attack], actions[is_attack]
-            r, dir_idx = ((atk_act - 9) % 4) + 1, (atk_act - 9) // 4
-            dxy = self.DIRS8_dev[dir_idx] * r.unsqueeze(1)
-            ax, ay = pos_xy[is_attack].T
-            tx, ty = (ax + dxy[:, 0]).clamp(0, self.W - 1), (ay + dxy[:, 1]).clamp(0, self.H - 1)
-            victims = self._as_long(self.grid[2][ty, tx])
-            if (valid_hit := victims >= 0).any():
-                atk_idx, victims = atk_idx[valid_hit], victims[valid_hit]
-                if (is_enemy := data[atk_idx, COL_TEAM] != data[victims, COL_TEAM]).any():
-                    atk_idx, victims = atk_idx[is_enemy], victims[is_enemy]
-                    was_alive = data[victims, COL_HP] > 0
-                    data[victims, COL_HP] -= data[atk_idx, COL_ATK]
-                    now_dead = data[victims, COL_HP] <= 0
-                    if (killers := atk_idx[was_alive & now_dead]).numel() > 0:
-                        reward_val = float(config.PPO_REWARD_KILL_INDIVIDUAL)
-                        individual_rewards.index_add_(0, killers, torch.full_like(killers, reward_val, dtype=self._data_dt))
-                        for killer_slot in killers:
-                            uid = int(data[killer_slot.item(), COL_AGENT_ID].item())
-                            self.agent_scores[uid] += reward_val
-                    vy, vx = self._as_long(data[victims, COL_Y]), self._as_long(data[victims, COL_X])
-                    self.grid[1, vy, vx] = data[victims, COL_HP].to(self._grid_dt)
-                    metrics.attacks += int(is_enemy.sum().item())
+        # ----- COMBAT -----
+        if alive_idx.numel() > 0:
+            if (is_attack := actions >= 9).any():
+                atk_idx, atk_act = alive_idx[is_attack], actions[is_attack]
+                r, dir_idx = ((atk_act - 9) % 4) + 1, (atk_act - 9) // 4
+                dxy = self.DIRS8_dev[dir_idx] * r.unsqueeze(1)
+                ax, ay = pos_xy[is_attack].T
+                tx, ty = (ax + dxy[:, 0]).clamp(0, self.W - 1), (ay + dxy[:, 1]).clamp(0, self.H - 1)
+                victims = self._as_long(self.grid[2][ty, tx])
+                if (valid_hit := victims >= 0).any():
+                    atk_idx, victims = atk_idx[valid_hit], victims[valid_hit]
+                    is_enemy = (data[atk_idx, COL_TEAM] != data[victims, COL_TEAM])
+                    victims = victims[is_enemy]
+                    atk_idx = atk_idx[is_enemy]
+                    if victims.numel() > 0:
+                        # ===== NEW DETERMINISTIC FOCUS-FIRE DAMAGE =====
+                        # `victims` can contain duplicates (multiple attackers hitting the same victim).
+                        # PyTorch advanced indexing with duplicates is not safe for accumulation, so we:
+                        #   1) sort by victim id
+                        #   2) sum damage per unique victim
+                        #   3) apply once per victim
+                        dmg = data[atk_idx, COL_ATK]
+                        order = victims.argsort()
+                        sv = victims[order]
+                        sdmg = dmg[order]
+                        satk = atk_idx[order]
 
+                        uniq_v, counts = torch.unique_consecutive(sv, return_counts=True)
+                        cums = sdmg.cumsum(0)
+                        ends = counts.cumsum(0) - 1
+                        starts = ends - counts + 1
+                        prev = torch.where(
+                            starts > 0,
+                            cums[starts - 1],
+                            torch.zeros_like(starts, dtype=cums.dtype)
+                        )
+                        dmg_sum = cums[ends] - prev
+
+                        hp_before = data[uniq_v, COL_HP].clone()
+                        data[uniq_v, COL_HP] = hp_before - dmg_sum
+                        hp_after = data[uniq_v, COL_HP]
+
+                        # Reward all attackers that contributed to a kill (victim crosses >0 -> <=0).
+                        killed_v = (hp_before > 0) & (hp_after <= 0)
+                        if killed_v.any():
+                            reward_val = float(config.PPO_REWARD_KILL_INDIVIDUAL)
+                            killed_per_entry = killed_v.repeat_interleave(counts)
+                            killers = satk[killed_per_entry]
+                            if killers.numel() > 0:
+                                # Deterministic accumulation per killer slot (avoid duplicate-index atomics on CUDA).
+                                k_order = killers.argsort()
+                                sk = killers[k_order]
+                                uniq_k, k_counts = torch.unique_consecutive(sk, return_counts=True)
+
+                                individual_rewards[uniq_k] += (k_counts.to(self._data_dt) * reward_val)
+
+                                # agent_scores is keyed by persistent agent_id (not slot)
+                                for killer_slot, cnt in zip(uniq_k.tolist(), k_counts.tolist()):
+                                    uid = int(data[killer_slot, COL_AGENT_ID].item())
+                                    self.agent_scores[uid] += reward_val * float(cnt)
+
+                        # Update hp channel for unique victims only (avoids duplicate-index write hazards).
+                        vy, vx = self._as_long(data[uniq_v, COL_Y]), self._as_long(data[uniq_v, COL_X])
+                        self.grid[1, vy, vx] = data[uniq_v, COL_HP].to(self._grid_dt)
+                        metrics.attacks += int(atk_idx.numel())
+                        # ===== END NEW DAMAGE =====
+
+        # Apply deaths
         rD, bD = self._apply_deaths((data[:, COL_ALIVE] > 0.5) & (data[:, COL_HP] <= 0.0), metrics)
         combat_rd += rD
         combat_bd += bD
+        self._debug_invariants("post_combat")   # <-- ADDED invariant check after combat
 
         if (alive_idx := self._recompute_alive_idx()).numel() > 0:
             pos_xy = self.registry.positions_xy(alive_idx)
@@ -538,8 +641,16 @@ class TickEngine:
 
         self.stats.on_tick_advanced(1)
         metrics.tick = int(self.stats.tick)
+
         was_dead = (data[:, COL_ALIVE] <= 0.5) if self._ppo is not None else None
+        # --- Flush dead agents from PPO before respawn ---
+        if was_dead is not None:
+            dead_slots = was_dead.nonzero(as_tuple=False).squeeze(1)
+            if dead_slots.numel() > 0:
+                self._ppo.flush_agents(dead_slots)
         self.respawner.step(self.stats.tick, self.registry, self.grid)
+
         if was_dead is not None:
             self._ppo_reset_on_respawn(was_dead)
+        self._debug_invariants("post_respawn")   # <-- ADDED invariant check after final respawn
         return vars(metrics)

@@ -178,7 +178,7 @@ def raycast8_firsthit(
     max_hp = float(getattr(config, "MAX_HP", 1.0))
     if max_hp <= 0:  # avoid div by zero
         max_hp = 1.0
-    hp_norm = (hp_first / max_hp).to(dtype)
+    hp_norm = (hp_first / max_hp).clamp(0.0, 1.0).to(dtype)
     dist_norm = dist_norm.to(dtype)
 
     # Concatenate per ray: onehot(6) + dist_norm + hp_norm -> 8 dims

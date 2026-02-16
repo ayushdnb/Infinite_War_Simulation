@@ -293,8 +293,8 @@ def _cell_free(grid: torch.Tensor, x: int, y: int, cfg: RespawnCfg) -> bool:
     H, W = grid.shape[1], grid.shape[2]
     return (cfg.wall_margin <= x < W - cfg.wall_margin and
             cfg.wall_margin <= y < H - cfg.wall_margin and
-            grid[0, y, x].item() == 0.0 and      # not a wall
-            grid[1, y, x].item() == 0.0)          # no agent present
+            grid[0, y, x].item() == 0.0 and      # empty (no wall, no agent)
+            grid[2, y, x].item() == -1.0)         # slot id must be -1 for empty
 
 
 def _pick_uniform(grid: torch.Tensor, cfg: RespawnCfg) -> Tuple[int, int]:
@@ -424,9 +424,13 @@ def _respawn_some(
         # Write to registry
         _write_agent_to_registry(reg, slot, team_id, x, y, unit_id, hp0, atk0, vision0, brain)
 
-        # Update grid: channel 0 = wall (unchanged), channel 1 = agent presence, channel 2 = team
-        grid[1, y, x] = 1.0
-        grid[2, y, x] = team_id
+        # Update grid (MUST MATCH spawn.py + raycast contract):
+        #   grid[0]: occupancy (0 empty, 1 wall, 2 red, 3 blue)
+        #   grid[1]: hp
+        #   grid[2]: slot id (agent index), -1 for empty
+        grid[0, y, x] = float(team_id)
+        grid[1, y, x] = float(hp0)
+        grid[2, y, x] = float(slot)
 
         spawned += 1
 

@@ -124,7 +124,7 @@ def raycast64_firsthit(
     onehot.scatter_(2, idx_valid.unsqueeze(-1), 1.0)
 
     max_hp = float(getattr(config, "MAX_HP", 1.0)) or 1.0
-    hp_norm = (hp_first / max_hp).to(dtype)
+    hp_norm = (hp_first / max_hp).clamp(0.0, 1.0).to(dtype)
     dist_norm = dist_norm.to(dtype)
 
     feat = torch.cat([onehot, dist_norm.unsqueeze(-1), hp_norm.unsqueeze(-1)], dim=-1)
