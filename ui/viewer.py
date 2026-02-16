@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import os
 import collections
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Optional, Dict, Any
 import math
+from pathlib import Path  # added for checkpoint path handling
 
 import pygame
 import torch
@@ -547,6 +548,7 @@ class SidePanel:
             "B: Toggle HP Bars",
             "N: Toggle Brain Labels",
             "S: Save Selected Brain",
+            "F9: Manual Checkpoint Save",   # added to legend
             "F11: Toggle Fullscreen",
         ]
         for line in controls:
@@ -700,6 +702,8 @@ class InputHandler:
                     self.viewer.show_brain_types = not self.viewer.show_brain_types
                 elif ev.key == pygame.K_s:
                     self.viewer.save_selected_brain()
+                elif ev.key == pygame.K_F9:               # added: manual checkpoint save
+                    self.viewer.save_requested = True
                 elif ev.key == pygame.K_F11:
                     self.viewer.fullscreen = not self.viewer.fullscreen
                     if self.viewer.fullscreen:
@@ -804,6 +808,10 @@ class Viewer:
 
         # Scores
         self.agent_scores: Dict[int, float] = collections.defaultdict(float)
+
+        # ---- Checkpoint (manual save) ----
+        self.save_requested: bool = False          # set True by F9 hotkey, consumed in run()
+        self._ckpt_last_status: str = ""           # optional status message
 
         # ---- Performance knobs ----
         # Refresh expensive CPU state every N frames.
@@ -935,8 +943,15 @@ class Viewer:
 
         engine._ppo.record_step = record_step_with_score_tracking
 
-    def run(self, engine, registry, stats, tick_limit: int = 0, target_fps: Optional[int] = None):
+    def run(self, engine, registry, stats, tick_limit: int = 0, target_fps: Optional[int] = None,
+            run_dir: Optional[str] = None):   # added run_dir for checkpointing
         self.registry, self.stats = registry, stats
+
+        # Lazy import checkpoint manager only if needed
+        ckpt_mgr = None
+        if run_dir is not None:
+            from utils.checkpointing import CheckpointManager
+            ckpt_mgr = CheckpointManager(Path(run_dir))
 
         self.layout = LayoutManager(self)
         self.world_renderer = WorldRenderer(self, self.grid, registry)
@@ -960,6 +975,40 @@ class Viewer:
         while running:
             # Input first (uses cached id_np for click)
             running, advance_tick = self.input_handler.handle()
+
+            # ------------------------------------------------------------
+            # Manual atomic checkpoint save (SAFE POINT: between ticks)
+            # ------------------------------------------------------------
+            if self.save_requested:
+                self.save_requested = False
+                if ckpt_mgr is None:
+                    self._ckpt_last_status = "Checkpoint save requested but run_dir is not set."
+                    print("[checkpoint]", self._ckpt_last_status)
+                else:
+                    try:
+                        # Capture viewer state for later restoration
+                        viewer_state = {
+                            "paused": bool(self.paused),
+                            "speed_mult": float(self.speed_multiplier),  # note: attribute is speed_multiplier
+                            "camera": {
+                                "offset_x": float(getattr(self.cam, "offset_x", 0.0)),
+                                "offset_y": float(getattr(self.cam, "offset_y", 0.0)),
+                                "zoom": float(getattr(self.cam, "zoom", 1.0)),
+                            },
+                            "agent_scores": dict(self.agent_scores),
+                        }
+                        out_dir = ckpt_mgr.save_atomic(
+                            engine=engine,
+                            registry=registry,
+                            stats=stats,
+                            viewer_state=viewer_state,
+                            notes="manual_hotkey_F9",
+                        )
+                        self._ckpt_last_status = f"Checkpoint saved: {out_dir.name}"
+                        print("[checkpoint]", self._ckpt_last_status)
+                    except Exception as ex:
+                        self._ckpt_last_status = f"Checkpoint FAILED: {type(ex).__name__}: {ex}"
+                        print("[checkpoint]", self._ckpt_last_status)
 
             # Decide ticks this frame
             num_ticks_this_frame = 0

@@ -26,6 +26,9 @@ from engine.mapgen import add_random_walls, make_zones
 from utils.persistence import ResultsWriter
 from ui.viewer import Viewer
 
+# NEW: Checkpoint manager to save/load simulation state
+from utils.checkpointing import CheckpointManager
+
 
 # ------------------------------- helpers -------------------------------
 
@@ -187,40 +190,93 @@ def main() -> None:
     # This prints your banner like: [final_war_sim] dev=... grid=... etc.
     print(config.summary_str())
 
-    # Build world
-    grid = make_grid(config.TORCH_DEVICE)
-    registry = AgentsRegistry(grid)
-    stats = SimulationStats()
-    add_random_walls(grid)
-    zones = make_zones(config.GRID_HEIGHT, config.GRID_WIDTH, device=config.TORCH_DEVICE)
+    # ------------------------------------------------------------------
+    # Checkpoint handling: if a checkpoint path is given, load it first.
+    # ------------------------------------------------------------------
+    ckpt = None  # will hold loaded checkpoint data if any
+    checkpoint_path = getattr(config, "CHECKPOINT_PATH", "")
 
-    # Spawning
-    spawn_mode = os.getenv("FWS_SPAWN_MODE", "uniform").lower()
-    if spawn_mode == "symmetric":
-        spawn_symmetric(registry, grid, per_team=config.START_AGENTS_PER_TEAM)
-        print('[SYMETRIC_SPAWNING]')
+    if checkpoint_path:
+        print(f"[main] Resuming from checkpoint: {checkpoint_path}")
+        # Load checkpoint onto CPU initially to avoid GPU memory fragmentation
+        ckpt = CheckpointManager.load(checkpoint_path, map_location="cpu")
+
+        # Extract world components (grid and zones) from checkpoint
+        # The grid tensor must be moved to the target device
+        grid = ckpt["world"]["grid"].to(config.TORCH_DEVICE)
+        zones = CheckpointManager.zones_from_checkpoint(
+            ckpt["world"], device=torch.device(config.TORCH_DEVICE)
+        )
+
+        # Create fresh registry and stats objects; they will be populated
+        # from checkpoint data after the engine is created.
+        registry = AgentsRegistry(grid)
+        stats = SimulationStats()
+
+        # No need to add walls or spawn agents now – they come from checkpoint.
+        print("[main] Checkpoint loaded – world restored, will restore runtime next.")
     else:
-        spawn_uniform_random(registry, grid, per_team=config.START_AGENTS_PER_TEAM)
-        print('[UNIFORM_RANDOM_SPAWNING]')
+        # No checkpoint: build a brand new world.
+        # Create grid (occupancy and feature channels)
+        grid = make_grid(config.TORCH_DEVICE)
+        registry = AgentsRegistry(grid)
+        stats = SimulationStats()
 
-    # Engine
+        # Add random walls to the grid
+        add_random_walls(grid)
+
+        # Create capture zones (control points)
+        zones = make_zones(config.GRID_HEIGHT, config.GRID_WIDTH, device=config.TORCH_DEVICE)
+
+        # Spawn initial agents according to environment variable or default
+        spawn_mode = os.getenv("FWS_SPAWN_MODE", "uniform").lower()
+        if spawn_mode == "symmetric":
+            spawn_symmetric(registry, grid, per_team=config.START_AGENTS_PER_TEAM)
+            print('[SYMMETRIC_SPAWNING]')
+        else:
+            spawn_uniform_random(registry, grid, per_team=config.START_AGENTS_PER_TEAM)
+            print('[UNIFORM_RANDOM_SPAWNING]')
+
+    # ------------------------------------------------------------------
+    # Create the tick engine (handles all simulation logic)
+    # ------------------------------------------------------------------
     print('[INITIATING_TICK_ENGINE]')
     engine = TickEngine(registry, grid, stats, zones=zones)
 
-    # Results
+    # ------------------------------------------------------------------
+    # If we loaded a checkpoint, apply all runtime state to the engine,
+    # registry, and stats (brains, PPO buffers, scores, respawn controller, RNG).
+    # ------------------------------------------------------------------
+    if ckpt is not None:
+        CheckpointManager.apply_loaded_checkpoint(
+            ckpt,
+            engine=engine,
+            registry=registry,
+            stats=stats,
+            device=torch.device(config.TORCH_DEVICE),
+        )
+        print("[main] Runtime state restored from checkpoint.")
+
+    # ------------------------------------------------------------------
+    # Results directory and logging setup
+    # ------------------------------------------------------------------
     rw = ResultsWriter()
+    # The `start` method creates a new run directory and returns its path.
+    # We pass a snapshot of the config to be saved as metadata.
     run_dir = Path(rw.start(config_obj=_config_snapshot()))  # ensure created by ResultsWriter
     _mkdir_p(run_dir)  # defensive: guarantee directory exists
     print(f"[main] Results → {run_dir}")
 
-    # Recorder
+    # ------------------------------------------------------------------
+    # Optional video recorder (depends on grid)
+    # ------------------------------------------------------------------
     recorder = _SimpleRecorder(
         run_dir, grid,
         fps=getattr(config, "VIDEO_FPS", 30),
         scale=getattr(config, "VIDEO_SCALE", 4),
     )
 
-    # Wrap tick to optionally record frames
+    # Wrap the engine's run_tick to also record frames if enabled
     _orig_run_tick = engine.run_tick
 
     def _run_tick_with_recording():
@@ -230,7 +286,9 @@ def main() -> None:
 
     engine.run_tick = _run_tick_with_recording
 
-    # Graceful signal handling: mark a flag we can read if needed
+    # ------------------------------------------------------------------
+    # Graceful signal handling
+    # ------------------------------------------------------------------
     shutdown_requested = {"flag": False}
 
     def _signal_handler(signum, frame):
@@ -244,7 +302,9 @@ def main() -> None:
         except Exception:
             pass
 
-    # Main run
+    # ------------------------------------------------------------------
+    # Main run loop
+    # ------------------------------------------------------------------
     start_ts = time.strftime("%Y-%m-%d_%H-%M-%S")
     start_time = time.time()
     status = "ok"
@@ -254,9 +314,11 @@ def main() -> None:
     try:
         if config.ENABLE_UI:
             viewer = Viewer(grid, cell_size=config.CELL_SIZE)
+            # Pass run_dir to viewer so manual checkpoints can be saved inside the run's folder
             viewer.run(engine, registry, stats,
                        tick_limit=config.TICK_LIMIT,
-                       target_fps=config.TARGET_FPS)
+                       target_fps=config.TARGET_FPS,
+                       run_dir=run_dir)   # <-- added run_dir argument
         else:
             _headless_loop(engine, stats, registry, grid, rw, limit=config.TICK_LIMIT)
     except KeyboardInterrupt:

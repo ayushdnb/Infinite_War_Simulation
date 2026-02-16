@@ -1,7 +1,8 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Any, Optional
 import math
+
 import torch
 import torch.nn.functional as F
 from torch import nn, optim
@@ -166,7 +167,190 @@ class PerAgentPPORuntime:
         self._step += 1
         if self._step % self.T == 0:
             self._train_window_and_clear()
+    from __future__ import annotations
 
+from typing import Any, Dict, Optional
+import torch
+
+
+def get_checkpoint_state(self) -> Dict[str, Any]:
+    """
+    Return a portable checkpoint payload:
+      - rollout buffers per agent id
+      - optimizer/scheduler state_dict per agent id
+      - global step counter
+    Tensors are moved to CPU for portability.
+    
+    Returns:
+        Dictionary containing all PPO state that can be saved to disk
+    """
+    def cpuize(x: Any) -> Any:
+        """
+        Recursively move tensors to CPU for portable checkpoints.
+        
+        Args:
+            x: Any Python object potentially containing torch tensors
+            
+        Returns:
+            Same structure with all tensors moved to CPU
+        """
+        # If input is a tensor, detach and move to CPU
+        if torch.is_tensor(x):
+            return x.detach().to("cpu")
+        
+        # If input is a dictionary, recursively process each value
+        if isinstance(x, dict):
+            return {k: cpuize(v) for k, v in x.items()}
+        
+        # If input is a list, recursively process each element
+        if isinstance(x, list):
+            return [cpuize(v) for v in x]
+        
+        # Return non-tensor objects unchanged
+        return x
+
+    # Prepare buffer data for each agent
+    buf_out: Dict[int, Any] = {}
+    for aid, b in self._buf.items():
+        # Convert agent ID to int for JSON serialization
+        buf_out[int(aid)] = {
+            # Convert each buffer component to CPU and store as list
+            "obs": cpuize(list(b.obs)),      # Observations buffer
+            "act": cpuize(list(b.act)),      # Actions buffer
+            "logp": cpuize(list(b.logp)),    # Log probabilities buffer
+            "val": cpuize(list(b.val)),      # Value estimates buffer
+            "rew": cpuize(list(b.rew)),      # Rewards buffer
+            "done": cpuize(list(b.done)),    # Done flags buffer
+        }
+
+    # Prepare optimizer state for each agent
+    opt_out = {int(aid): cpuize(opt.state_dict()) for aid, opt in self._opt.items()}
+    
+    # Prepare scheduler state for each agent
+    sched_out = {int(aid): cpuize(s.state_dict()) for aid, s in self._sched.items()}
+
+    # Return complete checkpoint state
+    return {
+        "step": int(self._step),        # Global step counter (cast to int for serialization)
+        "buf": buf_out,                  # Rollout buffers per agent
+        "opt": opt_out,                   # Optimizer states per agent
+        "sched": sched_out,                # Scheduler states per agent
+    }
+
+
+def load_checkpoint_state(
+    self,
+    state: Dict[str, Any],
+    *,
+    registry: Any,
+    device: Optional[torch.device] = None,
+) -> None:
+    """
+    Restore PPO runtime from checkpoint payload produced by get_checkpoint_state().
+    
+    Notes:
+      - We recreate optimizers/schedulers then load their state_dict.
+      - After loading optimizer state_dict, we move state tensors to the target device.
+    
+    Args:
+        state: Checkpoint state dictionary from get_checkpoint_state()
+        registry: Agent registry containing brains/models
+        device: Target device for tensors (uses self.device if None)
+    """
+    # Determine target device
+    dev = device or self.device
+
+    def to_dev(x: Any) -> Any:
+        """
+        Recursively move tensors to target device.
+        
+        Args:
+            x: Any Python object potentially containing torch tensors
+            
+        Returns:
+            Same structure with all tensors moved to target device
+        """
+        # If input is a tensor, move to target device
+        if torch.is_tensor(x):
+            return x.to(dev)
+        
+        # If input is a list, recursively process each element
+        if isinstance(x, list):
+            return [to_dev(v) for v in x]
+        
+        # Return non-tensor objects unchanged
+        return x
+
+    # Restore global step counter
+    self._step = int(state.get("step", 0))
+
+    # --- Restore rollout buffers ---
+    self._buf.clear()  # Clear existing buffers
+    buf_in: Dict[int, Any] = state.get("buf", {})
+    
+    for aid, payload in buf_in.items():
+        # Convert agent ID to int
+        aid_i = int(aid)
+        
+        # Create new buffer with restored data moved to target device
+        self._buf[aid_i] = _Buf(
+            obs=to_dev(payload.get("obs", [])),      # Restore observations
+            act=to_dev(payload.get("act", [])),      # Restore actions
+            logp=to_dev(payload.get("logp", [])),    # Restore log probabilities
+            val=to_dev(payload.get("val", [])),      # Restore value estimates
+            rew=to_dev(payload.get("rew", [])),      # Restore rewards
+            done=to_dev(payload.get("done", [])),    # Restore done flags
+        )
+
+    # --- Restore optimizer and scheduler states ---
+    opt_in: Dict[int, Any] = state.get("opt", {})      # Optimizer states from checkpoint
+    sched_in: Dict[int, Any] = state.get("sched", {})  # Scheduler states from checkpoint
+
+    # Clear existing optimizers and schedulers
+    self._opt.clear()
+    self._sched.clear()
+
+    # Restore optimizers first (schedulers depend on optimizers)
+    for aid, opt_sd in opt_in.items():
+        aid_i = int(aid)
+        
+        # Get the model/brain for this agent
+        model = self._model_for_aid(registry, aid_i)
+        
+        # Create new optimizer (will be configured with current hyperparameters)
+        opt = self._get_opt(model, aid_i)
+        
+        # Load the saved optimizer state
+        opt.load_state_dict(opt_sd)
+        
+        # Move optimizer state tensors to target device
+        # Optimizer state is stored in opt.state as a dictionary per parameter
+        for st in opt.state.values():
+            for k, v in list(st.items()):
+                if torch.is_tensor(v):
+                    st[k] = v.to(dev)
+        
+        # Store restored optimizer
+        self._opt[aid_i] = opt
+
+    # Restore schedulers
+    for aid, sch_sd in sched_in.items():
+        aid_i = int(aid)
+        
+        # Ensure optimizer exists for this agent
+        if aid_i not in self._opt:
+            # If optimizer wasn't restored (e.g., missing in checkpoint), create it
+            model = self._model_for_aid(registry, aid_i)
+            self._opt[aid_i] = self._get_opt(model, aid_i)
+        
+        # Create new scheduler linked to the restored optimizer
+        sch = self._get_sched(self._opt[aid_i], aid_i)
+        
+        # Load saved scheduler state
+        sch.load_state_dict(sch_sd)
+        
+        # Store restored scheduler
+        self._sched[aid_i] = sch
     def _gae(self, rewards: torch.Tensor, values: torch.Tensor, dones: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         T = rewards.numel()
         adv = torch.zeros_like(rewards)

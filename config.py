@@ -52,6 +52,8 @@ RNG_SEED: int = _env_int("FWS_SEED", 0)
 
 RESULTS_DIR: str = _env_str("FWS_RESULTS_DIR", "results").strip()
 
+#Optional: resume from a checkpoint (directory containing DONE+checkpoint.pt, or a direct checkpoint.pt path)
+CHECKPOINT_PATH: str = _env_str("FWS_CHECKPOINT_PATH", "").strip()
 # =============================================================================
 # 💻 HARDWARE ACCELERATION & TENSOR COMPILER
 # =============================================================================
