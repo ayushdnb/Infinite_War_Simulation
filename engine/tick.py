@@ -356,6 +356,7 @@ class TickEngine:
 
         metrics.alive = int(alive_idx.numel())
 
+        # ----- MOVE HANDLING WITH CONFLICT RESOLUTION (Law 1) -----
         is_move = (actions >= 1) & (actions <= 8)
         if is_move.any():
             move_idx, dir_idx = alive_idx[is_move], actions[is_move] - 1
@@ -364,12 +365,74 @@ class TickEngine:
             can_move = (self.grid[0][ny, nx] == self._g0)
             if can_move.any():
                 move_idx, x0, y0, nx, ny = move_idx[can_move], x0[can_move], y0[can_move], nx[can_move], ny[can_move]
-                self.grid[0, y0, x0], self.grid[1, y0, x0], self.grid[2, y0, x0] = self._g0, self._g0, self._gneg
-                data[move_idx, COL_X], data[move_idx, COL_Y] = nx.to(self._data_dt), ny.to(self._data_dt)
-                self.grid[0, ny, nx] = data[move_idx, COL_TEAM].to(self._grid_dt)
-                self.grid[1, ny, nx] = data[move_idx, COL_HP].to(self._grid_dt)
-                self.grid[2, ny, nx] = move_idx.to(self._grid_dt)
-                metrics.moved = int(can_move.sum().item())
+
+                # -------------------- MOVE CONFLICT RESOLUTION (Law 1) --------------------
+                # Candidates are already filtered by can_move (destination cell empty).
+                # If multiple candidates target the same destination in the same tick:
+                #   winner = highest HP; tie for highest HP -> nobody moves to that cell.
+                dest_key = (ny * self.W + nx).to(torch.long)   # (M,) unique cell id
+                hp = data[move_idx, COL_HP]                   # (M,) HP used for winner rule
+
+                # Fast path (vectorized): per-destination max HP + count of max-HP claimants.
+                # Deterministic: ties never pick a random winner; they block the move.
+                try:
+                    num_cells = self.H * self.W
+                    max_hp = torch.full((num_cells,), torch.finfo(hp.dtype).min, device=self.device, dtype=hp.dtype)
+                    max_hp.scatter_reduce_(0, dest_key, hp, reduce="amax", include_self=True)
+                    is_max = (hp == max_hp[dest_key])
+                    max_cnt = torch.zeros((num_cells,), device=self.device, dtype=torch.int32)
+                    max_cnt.scatter_add_(0, dest_key, is_max.to(torch.int32))
+                    winner_mask = is_max & (max_cnt[dest_key] == 1)
+                except Exception:
+                    # Fallback: deterministic group scan after sorting by destination.
+                    # Only used if scatter_reduce_ is unavailable in the runtime Torch build.
+                    winner_mask = torch.zeros_like(dest_key, dtype=torch.bool)
+                    order = torch.argsort(dest_key)
+                    dest_s = dest_key[order]
+                    hp_s = hp[order]
+                    if dest_s.numel() > 0:
+                        starts = torch.cat([
+                            torch.zeros(1, device=self.device, dtype=torch.long),
+                            (dest_s[1:] != dest_s[:-1]).nonzero(as_tuple=False).squeeze(1) + 1
+                        ])
+                        ends = torch.cat([starts[1:], torch.tensor([dest_s.numel()], device=self.device, dtype=torch.long)])
+                        for s, e in zip(starts.tolist(), ends.tolist()):
+                            group_hp = hp_s[s:e]
+                            m = group_hp.max()
+                            is_m = (group_hp == m)
+                            if int(is_m.sum().item()) == 1:
+                                win_off = int(is_m.nonzero(as_tuple=False)[0].item()) + s
+                                winner_mask[order[win_off]] = True
+
+                if winner_mask.any():
+                    w_move_idx = move_idx[winner_mask]
+                    w_x0, w_y0, w_nx, w_ny = x0[winner_mask], y0[winner_mask], nx[winner_mask], ny[winner_mask]
+
+                    # Commit movement ONLY for winners; losers keep their original cells.
+                    self.grid[0, w_y0, w_x0], self.grid[1, w_y0, w_x0], self.grid[2, w_y0, w_x0] = self._g0, self._g0, self._gneg
+                    data[w_move_idx, COL_X], data[w_move_idx, COL_Y] = w_nx.to(self._data_dt), w_ny.to(self._data_dt)
+                    self.grid[0, w_ny, w_nx] = data[w_move_idx, COL_TEAM].to(self._grid_dt)
+                    self.grid[1, w_ny, w_nx] = data[w_move_idx, COL_HP].to(self._grid_dt)
+                    self.grid[2, w_ny, w_nx] = w_move_idx.to(self._grid_dt)
+
+                    # Count *actual* movement winners (not just candidates).
+                    metrics.moved = int(w_move_idx.numel())
+
+                    # Optional debug-only invariant checks (default off; no cost unless enabled).
+                    # Enable with: FWS_DEBUG_MOVE=1
+                    import os
+                    if os.getenv("FWS_DEBUG_MOVE", "0") in {"1", "true", "True"}:
+                        # Each alive slot should appear exactly once in grid[2].
+                        ids = self._as_long(self.grid[2]).view(-1)
+                        present = ids[ids >= 0]
+                        counts = torch.bincount(present, minlength=self.registry.capacity)
+                        alive_slots = (data[:, COL_ALIVE] > 0.5).nonzero(as_tuple=False).squeeze(1)
+                        bad = alive_slots[counts[alive_slots] != 1]
+                        if bad.numel() > 0:
+                            sl = bad[:16].tolist()
+                            suffix = "" if bad.numel() <= 16 else "..."
+                            raise RuntimeError(f"[move invariant] alive slots not exactly once in grid: {sl}{suffix}")
+        # ----- END MOVE HANDLING -----
 
         combat_rd, combat_bd = 0, 0
         meta_rd, meta_bd = 0, 0

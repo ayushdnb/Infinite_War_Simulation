@@ -86,8 +86,8 @@ VMAP_DEBUG = _env_bool("FWS_VMAP_DEBUG", False)
 # 160x160 is massively larger than 120x120 (25,600 cells vs 14,400 cells).
 # This gives the agents room to execute flanking maneuvers rather than just 
 # crashing into each other in a center death-ball.
-GRID_WIDTH  = _env_int("FWS_GRID_W", 120)
-GRID_HEIGHT = _env_int("FWS_GRID_H", 120)
+GRID_WIDTH  = _env_int("FWS_GRID_W", 50)
+GRID_HEIGHT = _env_int("FWS_GRID_H", 50)
 
 # START_AGENTS defines the initial drop. 500 per team = 1000 agents actively 
 # computing raycasts and attention matrices simultaneously. 
@@ -111,7 +111,7 @@ AGENT_FEATURES = 10
 
 # Increased walls to accommodate the massive 160x160 map. Creates distinct 
 # "lanes" and "choke points" for tactical combat.
-RANDOM_WALLS = _env_int("FWS_RAND_WALLS", 21)
+RANDOM_WALLS = _env_int("FWS_RAND_WALLS",0)
 WALL_SEG_MIN = _env_int("FWS_WALL_SEG_MIN", 10)
 WALL_SEG_MAX = _env_int("FWS_WALL_SEG_MAX", 80)
 WALL_AVOID_MARGIN = _env_int("FWS_WALL_MARGIN", 3)

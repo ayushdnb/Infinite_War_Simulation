@@ -88,25 +88,66 @@ def _param_count(model: nn.Module) -> int:
 
 
 class TextCache:
+    """
+    Caches:
+      1) pygame Font objects per size  (self.fonts[size])
+      2) rendered text surfaces per (text, size, color, aa)  (self.cache[key])
+
+    Why your crash happened:
+      - You only pre-created fonts for 13/16/18
+      - But brain labels request size 10..16
+      - So self.fonts[10] raised KeyError
+
+    Fix A:
+      - If a requested font size doesn't exist, create it on-demand.
+    """
     def __init__(self):
+        # Keep a few common defaults (fast warm-start)
         self.fonts = {
             13: self._mk_font(13),
             16: self._mk_font(16),
             18: self._mk_font(18),
         }
+
+        # Rendered surface cache: (text, size, color, aa) -> pygame.Surface
         self.cache = {}
 
     def _mk_font(self, sz: int):
+        """
+        Build a pygame Font safely.
+        SysFont can fail on some machines; fall back to default pygame font.
+        """
         try:
             return pygame.font.SysFont(FONT_NAME, sz)
         except Exception:
             return pygame.font.Font(None, sz)
 
     def render(self, text: str, size: int, color, aa: bool = True):
+        """
+        Return a cached rendered surface for the given text settings.
+        Creates the font for `size` if it wasn't pre-created (Fix A).
+        """
+        # --- Safety: normalize inputs (prevents weird cache blowups) ---
+        if not isinstance(text, str):
+            text = str(text)
+
+        # Avoid invalid sizes; pygame fonts need positive ints.
+        size = int(size)
+        if size < 1:
+            size = 1
+
+        # --- Fix A: create missing font sizes on-demand ---
+        if size not in self.fonts:
+            self.fonts[size] = self._mk_font(size)
+
         key = (text, size, color, aa)
+
+        # Render once per unique key
         if key not in self.cache:
             self.cache[key] = self.fonts[size].render(text, aa, color)
+
         return self.cache[key]
+
 
 
 # =========================
